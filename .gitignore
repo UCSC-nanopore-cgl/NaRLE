@@ -1,0 +1,10 @@
+.idea*
+venv
+s3am
+*.pyc
+config*.yaml
+manifest*.tsv
+*.gz
+*.tbi
+*.log
+*.egg-info
