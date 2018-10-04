@@ -50,28 +50,37 @@ DEFAULT_MANIFEST_NAME = 'manifest-toil-nanopore.tsv'
 # docker images
 DOCKER_SAMTOOLS_IMG = "quay.io/ucsc_cgl/samtools"
 DOCKER_SAMTOOLS_TAG = "1.8--cba1ddbca3e1ab94813b58e40e56ab87a59f1997"
+
 DOCKER_SAMTOOLS_SORT_IMG = "tpesout/samtools_sort"
 DOCKER_SAMTOOLS_SORT_TAG = "latest"
+DOCKER_SAMTOOLS_SORT_OUT = "samtools_sort.bam"
+DOCKER_SAMTOOLS_SORT_LOG = "samtools_sort.log"
+
 DOCKER_MINIMAP2_IMG = "tpesout/minmap2"
 DOCKER_MINIMAP2_TAG = "latest"
+DOCKER_MINIMAP2_OUT = "minimap2.sam"
+DOCKER_MINIMAP2_LOG = "minimap2.log"
+
 DOCKER_NAPPER_IMG = "tpesout/napper"
 DOCKER_NAPPER_TAG = "latest"
-
-# docker output file name
-DOCKER_MINIMAP2_OUT = "minimap2.sam"
-DOCKER_SAMTOOLS_SORT_OUT = "samtools_sort.bam"
-
-# docker log file names
-DOCKER_MINIMAP2_LOG = "minimap2.log"
 DOCKER_NAPPER_LOG = "napper.log"
-DOCKER_SAMTOOLS_SORT_LOG = "samtools_sort.log"
+
+DOCKER_ALIGNQC_IMG = "tpesout/alignqc"
+DOCKER_ALIGNQC_TAG = "latest"
+DOCKER_ALIGNQC_LOG = "alignqc.log"
 
 # resource
 DEFAULT_CPU = 8
-ALN_MEM_FASTQ_FACTOR = 1
-ALN_MEM_REF_FACTOR = 1
-ALN_DSK_FASTQ_FACTOR = 1
-ALN_DSK_REF_FACTOR = 1
+
+ALN_FASTQ_MEM_FACTOR = 1
+ALN_FASTQ_DSK_FACTOR = 1
+ALN_REF_MEM_FACTOR = 1
+ALN_REF_DSK_FACTOR = 1
+
+AQC_BAM_MEM_FACTOR = 1
+AQC_BAM_DSK_FACTOR = 1
+AQC_REF_MEM_FACTOR = 1
+AQC_REF_DSK_FACTOR = 1
 
 # job data
 JD_RAW_FASTQ = 'raw_fastq'
@@ -82,6 +91,7 @@ JD_RLE_REF = 'rle_ref'
 JD_RLE_REF_RL = 'rle_ref_rl'
 JD_RAW_BAM = 'raw_bam'
 JD_RLE_BAM = 'rle_bam'
+JD_ALIGNQC = 'alignqc'
 
 # file types
 FT_FASTA = ['.fa', '.fasta', '.fa.gz', '.fasta.gz']
@@ -155,7 +165,7 @@ def prepare_input(job, sample, config):
     rle_fastq_rl_fileid = None
     if config.rle_type != RLE_NONE:
         # do the encoding
-        ref_rle_basename, ref_rle_rl_basename = napper_rle(job, config, work_dir, os.path.basename(ref_genome_location),
+        ref_rle_basename, ref_rle_rl_basename = docker_napper_rle(job, config, work_dir, os.path.basename(ref_genome_location),
                                                            "RLE.{}.{}".format(uuid, ref_genome_basename))
         # get locations
         ref_rle_location = os.path.join(work_dir, ref_rle_basename)
@@ -172,7 +182,7 @@ def prepare_input(job, sample, config):
                        output_dir=config.intermediate_file_location)
     if config.rle_type == RLE_PRE_ALIGN:
         # do the encoding
-        fastq_rle_basename, fastq_rle_rl_basename = napper_rle(job, config, work_dir, os.path.basename(fastq_location),
+        fastq_rle_basename, fastq_rle_rl_basename = docker_napper_rle(job, config, work_dir, os.path.basename(fastq_location),
                                                            "RLE.{}.{}".format(uuid, fastq_basename))
         # get locations
         fastq_rle_location = os.path.join(work_dir, fastq_rle_basename)
@@ -188,13 +198,6 @@ def prepare_input(job, sample, config):
             copy_files(file_paths=[fastq_rle_location, fastq_rle_rl_location, log_location],
                        output_dir=config.intermediate_file_location)
 
-    # alignment resource usage
-    aln_cpu = config.defaultCores
-    aln_mem = int(min(int(fastq_size * ALN_MEM_FASTQ_FACTOR + ref_genome_size * ALN_MEM_REF_FACTOR),
-                      config.maxMemory))
-    aln_dsk = int(min(int(fastq_size * ALN_DSK_FASTQ_FACTOR + ref_genome_size * ALN_DSK_REF_FACTOR),
-                      config.maxDisk))
-
     # job data
     job_data = {
         JD_RAW_FASTQ: fastq_fileid,
@@ -207,8 +210,18 @@ def prepare_input(job, sample, config):
         JD_RLE_BAM: None,
     }
 
+    # alignment resource usage
+    aln_cpu = config.defaultCores
+    aln_mem = int(min(int(fastq_size * ALN_FASTQ_MEM_FACTOR + ref_genome_size * ALN_REF_MEM_FACTOR),
+                      config.maxMemory))
+    aln_dsk = int(min(int(fastq_size * ALN_FASTQ_DSK_FACTOR + ref_genome_size * ALN_REF_DSK_FACTOR),
+                      config.maxDisk))
+
     # submit align job
     align_job = job.addChildJobFn(align, config, job_data, memory=aln_mem, cores=aln_cpu, disk=aln_dsk)
+
+    # submit final consolidation job
+    consolidate_output_job = align_job.addFollowOnJobFn(consolidate_output, config, align_job.rv())
 
     # log
     log_time(job, "prepare_input", start, config.uuid)
@@ -234,8 +247,8 @@ def align(job, config, job_data):
     # do alignment
     alignment_filename = "{}.{}.unsorted.sam".format(rle_identifier, uuid)
     alignment_location = os.path.join(work_dir, alignment_filename)
-    minimap2(job, config, work_dir, input_reads_filename, input_ref_filename, output_filename=alignment_filename,
-             kmer_size=18 if rle_input else 15)
+    docker_minimap2(job, config, work_dir, input_reads_filename, input_ref_filename, output_filename=alignment_filename,
+                    kmer_size=18 if rle_input else 15)
     if not os.path.isfile(alignment_location):
         raise UserError("Alignment file {} not created for {}".format(alignment_filename, uuid))
     if config.intermediate_file_location is not None:
@@ -246,7 +259,7 @@ def align(job, config, job_data):
     # sort it
     sorted_aln_filename = "{}.{}.bam".format(rle_identifier, uuid)
     sorted_aln_location = os.path.join(work_dir, sorted_aln_filename)
-    samtools_sort(job, config, work_dir, alignment_filename, output_filename=sorted_aln_filename)
+    docker_samtools_sort(job, config, work_dir, alignment_filename, output_filename=sorted_aln_filename)
     if not os.path.isfile(sorted_aln_location):
         raise UserError("Sorted alignment file {} not created for {}".format(sorted_aln_filename, uuid))
     if config.intermediate_file_location is not None:
@@ -258,24 +271,144 @@ def align(job, config, job_data):
     sorted_aln_fileid = job.fileStore.writeGlobalFile(sorted_aln_location)
     job_data[JD_RLE_BAM if rle_input else JD_RAW_BAM] = sorted_aln_fileid
 
+    # next steps
+    return_values = list()
+    return_values.append(job_data)
+
+    # do alignment quality control (if appropriate)
+    do_align_qc = True # todo move this to config
+    if do_align_qc:
+        # resource estimation
+        sorted_aln_size = os.stat(sorted_aln_location).st_size
+        ref_genome_size = os.stat(input_ref_location).st_size
+        aqc_cpu = 1
+        aqc_mem = int(min(int(sorted_aln_size * AQC_BAM_MEM_FACTOR + ref_genome_size * AQC_REF_MEM_FACTOR),
+                          config.maxMemory))
+        aqc_dsk = int(min(int(sorted_aln_size * AQC_BAM_DSK_FACTOR + ref_genome_size * AQC_REF_DSK_FACTOR),
+                          config.maxDisk))
+        # alignqc job
+        alignqc_job = job.addChildJobFn(alignqc, config, job_data, memory=aqc_mem, cores=aqc_cpu, disk=aqc_dsk)
+        return_values.append(alignqc_job.rv())
+
+    # todo add marginphase
+
     # log
     log_time(job, "align", start, uuid)
+    return return_values
+
+
+def alignqc(job, config, job_data):
+    # prep
+    start = time.time()
+    uuid = config.uuid
+    work_dir = job.tempDir
+    rle_input = config.rle_type in [RLE_PRE_ALIGN]
+    rle_identifier = "RLE" if rle_input else "RAW"
+
+    # download files
+    input_bam_filename = "{}.{}.bam".format(rle_identifier, uuid)
+    input_bam_location = os.path.join(work_dir, input_bam_filename)
+    job.fileStore.readGlobalFile(job_data[JD_RLE_BAM if rle_input else JD_RAW_BAM], input_bam_location)
+    input_ref_filename = "{}.{}.ref.fa".format(rle_identifier, uuid)
+    input_ref_location = os.path.join(work_dir, input_ref_filename)
+    job.fileStore.readGlobalFile(job_data[JD_RLE_REF if rle_input else JD_RAW_REF], input_ref_location)
+
+    # do alignqc
+    alignqc_filename = "{}.{}.alignqc.xhtml".format(rle_identifier, uuid)
+    alignqc_location = os.path.join(work_dir, alignqc_filename)
+    success = docker_alignqc(job, config, work_dir, input_bam_filename, input_ref_filename, alignqc_filename)
+
+    # sanity check (failure is ok here)
+    if not success:
+        log(job, "AlignQC Failure!", uuid, 'alignqc')
+        log_time(job, "alignqc", start, uuid)
+        return job_data
+
+    # save output
+    if config.intermediate_file_location is not None:
+        log_location = os.path.join(work_dir, "alignqc.{}.log".format(input_bam_filename))
+        os.rename(os.path.join(work_dir, DOCKER_ALIGNQC_LOG), log_location)
+        copy_files(file_paths=[alignqc_location, log_location], output_dir=config.intermediate_file_location)
+
+    # save to jobstore
+    alignqc_fileid = job.fileStore.writeGlobalFile(alignqc_location)
+    job_data[JD_ALIGNQC] = alignqc_fileid
+
+    # log
+    log_time(job, "alignqc", start, uuid)
     return job_data
+
+
+def consolidate_output(job, config, job_data_list):
+    # prep
+    start = time.time()
+    uuid = config.uuid
+    work_dir = job.tempDir
+
+    # consolodate all data
+    final_job_data = dict()
+    for i, job_data in enumerate(job_data_list):
+        log(job, "JOB_DATA_{}: {}".format(i, job_data), uuid, 'consolidate_output')
+        for jdk in job_data.keys():
+            jdv = job_data[jdk]
+            if jdv is None: continue
+            if jdk in final_job_data and final_job_data[jdk] != jdv:
+                log(job, "Found different non-null values during data consolidation: {} -> [{},{}]".format(
+                    jdk, jdv, final_job_data[jdk]), uuid, 'consolidate_output')
+            final_job_data[jdk] = jdv
+
+    # loggit
+    log(job, "Consolidated job data: {}".format(final_job_data), uuid, 'consolidate_output')
+
+    # log
+    log_time(job, "consolidate_output", start, uuid)
+    return final_job_data
 
 
 ###########################################################
 #                 JOB UTILITY FUNCTIONS                   #
 ###########################################################
 
+def docker_alignqc(job, config, work_dir, bam_filename, ref_filename, output_filename, extra_args=None):
+    # prep
+    bam_location = os.path.join("/data", bam_filename)
+    ref_location = os.path.join("/data", ref_filename)
+    out_location = os.path.join("/data", output_filename)
+    args = ['analyze', bam_location, '-g', ref_location, '--no_transcriptome', '-o', out_location]
+    if extra_args is not None:
+        duplicated_args = list(filter(lambda x: x in args, extra_args))
+        if len(duplicated_args) > 0:
+            log(job, "Duplicated args in call to alignqc: {}".format(duplicated_args), config.uuid, 'alignqc')
+        args.extend(extra_args)
 
-def samtools_sort(job, config, work_dir, input_filename, output_filename=None, extra_args=None):
+    try:
+        # call
+        docker_call(job, config, work_dir, args, DOCKER_ALIGNQC_IMG, DOCKER_ALIGNQC_TAG)
+
+        # loggit
+        log_file = os.path.join(work_dir, DOCKER_ALIGNQC_LOG)
+        log_debug_from_docker(job, log_file, config.uuid, 'alignqc', input_file_locations=[
+            os.path.join(work_dir, bam_filename), os.path.join(work_dir, ref_filename)])
+
+        # sanity check
+        require_docker_file_output(job, config, work_dir, [output_filename], 'alignqc', DOCKER_ALIGNQC_LOG)
+    except Exception, e:
+        log(job, "Error ({}) in AlignQC output: {}".format(type(e), e), config.uuid, 'alignqc')
+        return None
+
+    # return output location
+    return output_filename
+
+
+def docker_samtools_sort(job, config, work_dir, input_filename, output_filename=None, extra_args=None):
     # prep
     data_location = os.path.join("/data", input_filename)
     args = [data_location, "-@", str(job.cores)]
     if extra_args is not None:
         duplicated_args = list(filter(lambda x: x in args, extra_args))
         if len(duplicated_args) > 0:
-            log(job, "Duplicated args in call to samtools_sort: {}".format(duplicated_args), config.uuid, 'samtools_sort')
+            log(job, "Duplicated args in call to samtools_sort: {}".format(duplicated_args), config.uuid,
+                'samtools_sort')
         args.extend(extra_args)
 
     # call
@@ -299,7 +432,7 @@ def samtools_sort(job, config, work_dir, input_filename, output_filename=None, e
 
 
 
-def minimap2(job, config, work_dir, input_filename, ref_filename, output_filename=None, kmer_size=15, extra_args=None):
+def docker_minimap2(job, config, work_dir, input_filename, ref_filename, output_filename=None, kmer_size=15, extra_args=None):
     # prep
     data_location = os.path.join("/data", input_filename)
     ref_location = os.path.join("/data", ref_filename)
@@ -341,7 +474,7 @@ def minimap2(job, config, work_dir, input_filename, ref_filename, output_filenam
         return DOCKER_MINIMAP2_OUT
 
 
-def index_bam(job, config, work_dir, bam_filename):
+def docker_index_bam(job, config, work_dir, bam_filename):
     # prep
     data_bam_location = os.path.join("/data", bam_filename)
     docker_params = ["index", data_bam_location]
@@ -354,7 +487,7 @@ def index_bam(job, config, work_dir, bam_filename):
         raise UserError("BAM index file not created for {}".format(bam_filename))
 
 
-def napper_rle(job, config, work_dir, filename, output_filename=None, type=None):
+def docker_napper_rle(job, config, work_dir, filename, output_filename=None, type=None):
     # try to infer type (if necessary)
     if type is None:
         if is_fasta(filename):
@@ -394,7 +527,7 @@ def napper_rle(job, config, work_dir, filename, output_filename=None, type=None)
 def docker_call(job, config, work_dir, params, image, tag):
     tagged_image = "{}:{}".format(image, tag)
     if DOCKER_LOGGING:
-        log(job, "Running {} with parameters: {}".format(tagged_image, params), config.uuid, 'docker')
+        log(job, "Running '{}' with parameters: {}".format(tagged_image, params), config.uuid, 'docker')
     apiDockerCall(job, tagged_image, working_dir=work_dir, parameters=params, user="root")
 
 
@@ -425,7 +558,7 @@ def require_docker_file_output(job, config, work_dir, output_filenames, function
                 with open(log_location) as log_stream:
                     for ll in log_stream:
                         if max_log_lines is None or log_lines < max_log_lines:
-                            log(job, "\t{}".format(ll.strip()), config.uuid, function_id)
+                            log(job, "\t{}".format(ll.rstrip()), config.uuid, function_id)
                         log_lines += 1
                 if max_log_lines is not None and log_lines <= max_log_lines:
                     log(job, "\t[{} lines total]".format(log_lines), config.uuid, function_id)
@@ -447,7 +580,9 @@ def log_debug_from_docker(job, log_file_location, identifier, function, input_fi
     if input_file_locations is not None:
         if type(input_file_locations) == str: input_file_locations = [input_file_locations]
         for input_file_location in input_file_locations:
-            log(job, "DEBUG_INPUT_FILESIZE:{}".format(os.stat(input_file_location).st_size), identifier, function)
+            log(job, "DEBUG_INPUT_FILESIZE:{}:".format(
+                os.stat(input_file_location).st_size, os.path.basename(input_file_location)),
+                identifier, function)
 
     # any logging from logfile
     with open(log_file_location) as log_file:
