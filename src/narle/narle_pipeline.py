@@ -224,6 +224,7 @@ def prepare_input(job, sample, config):
     consolidate_output_job = align_job.addFollowOnJobFn(consolidate_output, config, align_job.rv())
 
     # log
+    log_generic_job_debug(job, config.uuid, 'prepare_input', work_dir=work_dir)
     log_time(job, "prepare_input", start, config.uuid)
 
 
@@ -293,6 +294,7 @@ def align(job, config, job_data):
     # todo add marginphase
 
     # log
+    log_generic_job_debug(job, uuid, 'align', work_dir=work_dir)
     log_time(job, "align", start, uuid)
     return return_values
 
@@ -317,6 +319,7 @@ def alignqc(job, config, job_data):
     alignqc_filename = "{}.{}.alignqc.xhtml".format(rle_identifier, uuid)
     alignqc_location = os.path.join(work_dir, alignqc_filename)
     success = docker_alignqc(job, config, work_dir, input_bam_filename, input_ref_filename, alignqc_filename)
+    log_generic_job_debug(job, uuid, 'alignqc', work_dir=work_dir)
 
     # sanity check (failure is ok here)
     if not success:
@@ -361,6 +364,7 @@ def consolidate_output(job, config, job_data_list):
     log(job, "Consolidated job data: {}".format(final_job_data), uuid, 'consolidate_output')
 
     # log
+    log_generic_job_debug(job, config.uuid, 'consolidate_output', work_dir=work_dir)
     log_time(job, "consolidate_output", start, uuid)
     return final_job_data
 
@@ -569,7 +573,6 @@ def require_docker_file_output(job, config, work_dir, output_filenames, function
         raise UserError("Missing files after running {} on {}: {}".format(function_id, config.uuid, missing_filenames))
 
 
-
 def log_debug_from_docker(job, log_file_location, identifier, function, input_file_locations=None):
     # sanity check
     if not os.path.isfile(log_file_location):
@@ -580,7 +583,7 @@ def log_debug_from_docker(job, log_file_location, identifier, function, input_fi
     if input_file_locations is not None:
         if type(input_file_locations) == str: input_file_locations = [input_file_locations]
         for input_file_location in input_file_locations:
-            log(job, "DEBUG_INPUT_FILESIZE:{}:".format(
+            log(job, "DEBUG_INPUT_FILESIZE:{}:{}".format(
                 os.stat(input_file_location).st_size, os.path.basename(input_file_location)),
                 identifier, function)
 
@@ -590,6 +593,26 @@ def log_debug_from_docker(job, log_file_location, identifier, function, input_fi
             line = line.strip()
             if line.startswith("DEBUG"):
                 log(job, line, identifier, function)
+
+
+def log_generic_job_debug(job, identifier, function, work_dir=None):
+
+    # job resource logging
+    log(job, "DEBUG_JOB_CORES:{}".format(job.cores), identifier, function)
+    log(job, "DEBUG_JOB_MEM:{}".format(job.memory), identifier, function)
+    log(job, "DEBUG_JOB_DISK:{}".format(job.disk), identifier, function)
+
+    # workdir logging
+    if work_dir is not None:
+        workdir_abspath = os.path.abspath(work_dir)
+        try:
+            du_line = subprocess.check_output(['du', '-s', workdir_abspath])
+            directory_filesize = du_line.split()[0]
+            log(job, "DEBUG_WORKDIR_FILESIZE:{}:{}".format(directory_filesize, workdir_abspath),
+                identifier, function)
+        except Exception, e:
+            log(job, "Exception ({}) finding size of directory {}: {}".format(type(e), workdir_abspath, e),
+                identifier, function)
 
 
 def log(job, message, identifier=None, function=None):
