@@ -30,6 +30,15 @@ from toil_lib import require, UserError
 from toil_lib.files import tarball_files, copy_files
 from toil_lib.urls import download_url, s3am_upload
 
+from toil_marginphase.marginphase_pipeline import prepare_input as mp_prepare_input
+from toil_marginphase.marginphase_pipeline import run_margin_phase as mp_run_margin_phase
+from toil_marginphase.marginphase_pipeline import merge_chunks as mp_merge_chunks
+from toil_marginphase.marginphase_core import DOCKER_CPECAN_IMG_DEFAULT, DOCKER_CPECAN_TAG_DEFAULT, \
+    DOCKER_MARGIN_PHASE_IMG_DEFAULT, DOCKER_MARGIN_PHASE_TAG_DEFAULT, TOIL_JOBSTORE_PROTOCOL
+
+
+
+
 # input / output schemes
 SCHEMES = ('http', 'file', 's3', 'ftp')
 
@@ -55,6 +64,11 @@ DOCKER_SAMTOOLS_SORT_IMG = "tpesout/samtools_sort"
 DOCKER_SAMTOOLS_SORT_TAG = "latest"
 DOCKER_SAMTOOLS_SORT_OUT = "samtools_sort.bam"
 DOCKER_SAMTOOLS_SORT_LOG = "samtools_sort.log"
+
+DOCKER_SAMTOOLS_VIEW_IMG = "tpesout/samtools_view"
+DOCKER_SAMTOOLS_VIEW_TAG = "latest"
+DOCKER_SAMTOOLS_VIEW_OUT = "samtools_view.out"
+DOCKER_SAMTOOLS_VIEW_LOG = "samtools_view.log"
 
 DOCKER_MINIMAP2_IMG = "tpesout/minmap2"
 DOCKER_MINIMAP2_TAG = "latest"
@@ -292,6 +306,8 @@ def align(job, config, job_data):
         return_values.append(alignqc_job.rv())
 
     # todo add marginphase
+    margin_phase_job = job.addChildJobFn(enqueue_margin_phase, config, job_data)
+    return_values.append(margin_phase_job.rv())
 
     # log
     log_generic_job_debug(job, uuid, 'align', work_dir=work_dir)
@@ -339,6 +355,68 @@ def alignqc(job, config, job_data):
 
     # log
     log_time(job, "alignqc", start, uuid)
+    return job_data
+
+
+def enqueue_margin_phase(job, config, job_data):
+    # prep
+    start = time.time()
+    uuid = config.uuid
+    work_dir = job.tempDir
+    rle_input = config.rle_type in [RLE_PRE_ALIGN]
+    rle_identifier = "RLE" if rle_input else "RAW"
+
+    # download files
+    input_bam_filename = "{}.{}.bam".format(rle_identifier, uuid)
+    input_bam_location = os.path.join(work_dir, input_bam_filename)
+    job.fileStore.readGlobalFile(job_data[JD_RLE_BAM if rle_input else JD_RAW_BAM], input_bam_location)
+    input_ref_filename = "{}.{}.ref.fa".format(rle_identifier, uuid)
+    input_ref_location = os.path.join(work_dir, input_ref_filename)
+    job.fileStore.readGlobalFile(job_data[JD_RLE_REF if rle_input else JD_RAW_REF], input_ref_location)
+
+    # get contigs in bam
+    docker_index_bam(job, config, work_dir, input_bam_filename)
+    bam_contigs = docker_get_contig_names(job, config, work_dir, input_bam_filename)
+    log(job, "Contigs found in {}: {}".format(input_bam_filename, bam_contigs))
+
+    # separate bam into contigs
+    contig_map = dict()
+    for contig in bam_contigs:
+        bam_contig_filename = "{}.{}.{}.bam".format(rle_identifier, uuid, contig)
+        docker_samtools_view(job, config, work_dir, input_bam_filename, selection_str=contig,
+                             output_filename=bam_contig_filename)
+        #todo save intermediate
+        #todo upload to filestore
+        #todo save in contig_map
+
+    # get contigs in reference
+    ref_contigs = set()
+    with open(input_ref_location) as ref_in:
+        for line in ref_in:
+            if line.startswith(">"):
+                pass
+            pass
+
+    # todo actually enqueue MP job
+    # margin_phase_config = {
+    #     'output_dir': None, #should not be used
+    #     'partition_size': 2000000,
+    #     'partition_margin': 50000,
+    #     'intermediate_file_location': config.intermediate_file_location,
+    #     'margin_phase_image': DOCKER_MARGIN_PHASE_IMG_DEFAULT,
+    #     'margin_phase_tag': DOCKER_MARGIN_PHASE_TAG_DEFAULT,
+    #     'cpecan_image': DOCKER_CPECAN_IMG_DEFAULT,
+    #     'cpecan_tag': DOCKER_CPECAN_TAG_DEFAULT,
+    #     'minimal_output': True,
+    #     'minimal_cpecan_output': True,
+    #     'cpecan_probabilities': True,
+    # }
+    #
+    # uuid = config.uuid
+    # sample = [uuid, url, contig_name, reference_url, params_url]
+    #
+    # mp_prepare_input(job, sample, config, enqueue_consolidation=True)
+
     return job_data
 
 
@@ -435,6 +513,59 @@ def docker_samtools_sort(job, config, work_dir, input_filename, output_filename=
         return DOCKER_SAMTOOLS_SORT_OUT
 
 
+def docker_samtools_sort(job, config, work_dir, input_filename, output_filename=None, extra_args=None):
+    # prep
+    data_location = os.path.join("/data", input_filename)
+    args = [data_location, "-@", str(job.cores)]
+    if extra_args is not None:
+        duplicated_args = list(filter(lambda x: x in args, extra_args))
+        if len(duplicated_args) > 0:
+            log(job, "Duplicated args in call to samtools_sort: {}".format(duplicated_args), config.uuid,
+                'samtools_sort')
+        args.extend(extra_args)
+
+    # call
+    docker_call(job, config, work_dir, args, DOCKER_SAMTOOLS_SORT_IMG, DOCKER_SAMTOOLS_SORT_TAG)
+
+    # loggit
+    log_file = os.path.join(work_dir, DOCKER_SAMTOOLS_SORT_LOG)
+    log_debug_from_docker(job, log_file, config.uuid, 'samtools_sort',
+                          input_file_locations=[os.path.join(work_dir, input_filename)])
+
+    # sanity check
+    require_docker_file_output(job, config, work_dir, [DOCKER_SAMTOOLS_SORT_OUT], 'samtools_sort',
+                               DOCKER_SAMTOOLS_SORT_LOG)
+
+    # rename file to appropriate output
+    if output_filename is not None:
+        os.rename(os.path.join(work_dir, DOCKER_SAMTOOLS_SORT_OUT), os.path.join(work_dir, output_filename))
+        return output_filename
+    else:
+        return DOCKER_SAMTOOLS_SORT_OUT
+
+
+def docker_samtools_view(job, config, work_dir, input_filename, selection_str=None, output_filename=None):
+    # prep
+    data_location = os.path.join("/data", input_filename)
+    args = ['-hb', data_location]
+    if selection_str is not None:
+        args.append(selection_str)
+
+    # call
+    docker_call(job, config, work_dir, args, DOCKER_SAMTOOLS_VIEW_IMG, DOCKER_SAMTOOLS_VIEW_TAG)
+
+    # sanity check
+    require_docker_file_output(job, config, work_dir, [DOCKER_SAMTOOLS_VIEW_OUT], 'samtools_view',
+                               DOCKER_SAMTOOLS_VIEW_LOG)
+
+    # rename file to appropriate output
+    if output_filename is not None:
+        os.rename(os.path.join(work_dir, DOCKER_SAMTOOLS_VIEW_OUT), os.path.join(work_dir, output_filename))
+        return output_filename
+    else:
+        return DOCKER_SAMTOOLS_VIEW_OUT
+
+
 
 def docker_minimap2(job, config, work_dir, input_filename, ref_filename, output_filename=None, kmer_size=15, extra_args=None):
     # prep
@@ -491,6 +622,28 @@ def docker_index_bam(job, config, work_dir, bam_filename):
         raise UserError("BAM index file not created for {}".format(bam_filename))
 
 
+def docker_get_contig_names(job, config, work_dir, bam_filename):
+    # prep
+    data_bam_location = os.path.join("/data", bam_filename)
+    samtools_params = ["view", '-H', data_bam_location]
+
+    # call
+    bam_header = docker_call(job, config, work_dir, samtools_params, DOCKER_SAMTOOLS_IMG, DOCKER_SAMTOOLS_TAG,
+                             stdout=True)
+    bam_header_lines = bam_header.split("\n")
+    contigs = list(set(map(lambda x: x.strip().split("\t")[1].replace("SN:",''),
+                       filter(lambda x: x.startswith("@SQ"), bam_header_lines))))
+
+    # sanity check
+    if len(contigs) == 0:
+        present_tags = set(map(lambda x: x.split("\t")[0], bam_header_lines))
+        log(job, "Could not find contigs in {}, with {} header lines and present tags {}".format(
+            bam_filename, len(bam_header_lines), present_tags), config.uuid, 'docker_get_contig_names')
+        raise UserError("Could not find contigs in {}".format(bam_filename))
+
+    return contigs
+
+
 def docker_napper_rle(job, config, work_dir, filename, output_filename=None, type=None):
     # try to infer type (if necessary)
     if type is None:
@@ -528,11 +681,12 @@ def docker_napper_rle(job, config, work_dir, filename, output_filename=None, typ
 ###########################################################
 
 
-def docker_call(job, config, work_dir, params, image, tag):
+def docker_call(job, config, work_dir, params, image, tag, detach=False, stdout=None, stderr=None):
     tagged_image = "{}:{}".format(image, tag)
     if DOCKER_LOGGING:
         log(job, "Running '{}' with parameters: {}".format(tagged_image, params), config.uuid, 'docker')
-    apiDockerCall(job, tagged_image, working_dir=work_dir, parameters=params, user="root")
+    return apiDockerCall(job, tagged_image, working_dir=work_dir, parameters=params, user="root", detach=detach,
+                         stdout=stdout, stderr=stderr)
 
 
 def require_docker_file_output(job, config, work_dir, output_filenames, function_id, log_filename=None,
