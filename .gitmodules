@@ -1,0 +1,3 @@
+[submodule "external/toil-marginPhase"]
+	path = external/toil-marginPhase
+	url = https://github.com/UCSC-nanopore-cgl/toil-marginPhase.git
