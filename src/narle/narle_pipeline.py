@@ -291,7 +291,7 @@ def align(job, config, job_data):
     return_values.append(job_data)
 
     # do alignment quality control (if appropriate)
-    do_align_qc = True # todo move this to config
+    do_align_qc = False # todo move this to config
     if do_align_qc:
         # resource estimation
         sorted_aln_size = os.stat(sorted_aln_location).st_size
@@ -354,6 +354,7 @@ def alignqc(job, config, job_data):
     job_data[JD_ALIGNQC] = alignqc_fileid
 
     # log
+    log_generic_job_debug(job, uuid, 'alignqc', work_dir=work_dir)
     log_time(job, "alignqc", start, uuid)
     return job_data
 
@@ -380,44 +381,166 @@ def enqueue_margin_phase(job, config, job_data):
     log(job, "Contigs found in {}: {}".format(input_bam_filename, bam_contigs))
 
     # separate bam into contigs
-    contig_map = dict()
+    margin_phase_sample_map = dict()
     for contig in bam_contigs:
         bam_contig_filename = "{}.{}.{}.bam".format(rle_identifier, uuid, contig)
         docker_samtools_view(job, config, work_dir, input_bam_filename, selection_str=contig,
                              output_filename=bam_contig_filename)
-        #todo save intermediate
-        #todo upload to filestore
-        #todo save in contig_map
+
+        # save files
+        bam_contig_location = os.path.join(work_dir, bam_contig_filename)
+        if config.intermediate_file_location is not None:
+            copy_files(file_paths=[bam_contig_location], output_dir=config.intermediate_file_location)
+        bam_contig_fileid = job.fileStore.writeGlobalFile(bam_contig_location)
+        margin_phase_sample_map[contig] = \
+            ["{}.{}".format(uuid, contig), "{}{}".format(TOIL_JOBSTORE_PROTOCOL, bam_contig_fileid), contig]
 
     # get contigs in reference
-    ref_contigs = set()
+    all_ref_contigs = list()
     with open(input_ref_location) as ref_in:
-        for line in ref_in:
-            if line.startswith(">"):
+        # how to handle contig when finished with it
+        def save_ref_contig(contig, location, out):
+            if out is None: return
+            out.close()
+            if config.intermediate_file_location is not None:
+                copy_files(file_paths=[location], output_dir=config.intermediate_file_location)
+            ref_contig_fileid = job.fileStore.writeGlobalFile(location)
+            margin_phase_sample_map[contig].append("{}{}".format(TOIL_JOBSTORE_PROTOCOL, bam_contig_fileid))
+
+        # data we need to track
+        contig_name = None
+        ref_contig_location = None
+        ref_contig_out = None
+
+        # handle all lines in ref
+        try:
+            for line in ref_in:
+                # new contig
+                if line.startswith(">"):
+                    # save old contig (if exists)
+                    if ref_contig_out is not None:
+                        save_ref_contig(contig_name, ref_contig_location, ref_contig_out)
+                    # get current contig
+                    contig_name = line.lstrip(">").strip().split()[0]
+                    all_ref_contigs.append(contig_name)
+                    # clear old data
+                    ref_contig_location = None
+                    ref_contig_out = None
+                    # intialize new data (if appropriate)
+                    if contig_name in margin_phase_sample_map:
+                        ref_contig_location = os.path.join(work_dir, "{}.{}.{}.ref.fa".format(
+                            rle_identifier, uuid, contig_name))
+                        ref_contig_out = open(ref_contig_location, 'w')
+
+                # write header or line if we care about contig
+                if ref_contig_out is not None:
+                    ref_contig_out.write(line)
                 pass
-            pass
+        # we don't expect problems here
+        except Exception, e:
+            log(job, "Got {} exception handling contig {} in {}: {}".format(type(e), contig_name, input_ref_filename, e),
+                uuid, 'enqueue_margin_phase')
+            raise e
+        # be sure to close file if unexpected problem
+        finally:
+            if ref_contig_out is not None: ref_contig_out.close()
 
-    # todo actually enqueue MP job
-    # margin_phase_config = {
-    #     'output_dir': None, #should not be used
-    #     'partition_size': 2000000,
-    #     'partition_margin': 50000,
-    #     'intermediate_file_location': config.intermediate_file_location,
-    #     'margin_phase_image': DOCKER_MARGIN_PHASE_IMG_DEFAULT,
-    #     'margin_phase_tag': DOCKER_MARGIN_PHASE_TAG_DEFAULT,
-    #     'cpecan_image': DOCKER_CPECAN_IMG_DEFAULT,
-    #     'cpecan_tag': DOCKER_CPECAN_TAG_DEFAULT,
-    #     'minimal_output': True,
-    #     'minimal_cpecan_output': True,
-    #     'cpecan_probabilities': True,
-    # }
-    #
-    # uuid = config.uuid
-    # sample = [uuid, url, contig_name, reference_url, params_url]
-    #
-    # mp_prepare_input(job, sample, config, enqueue_consolidation=True)
+        # save the last ref_contig
+        if ref_contig_out is not None:
+            save_ref_contig(contig_name, ref_contig_location, ref_contig_out)
 
-    return job_data
+    # get all contigs we have bam and ref for (should be all)
+    margin_phase_contigs = list(filter(lambda x: len(margin_phase_sample_map[x]) == 4, margin_phase_sample_map.keys()))
+    margin_phase_contigs.sort()
+    if len(margin_phase_contigs) != len(margin_phase_sample_map):
+        missing_margin_phase_contigs = list(filter(lambda x: x not in margin_phase_contigs, margin_phase_sample_map.keys()))
+        missing_margin_phase_contigs.sort()
+        all_ref_contigs.sort()
+        log(job, "Missing contigs in ref which were found in aligned bam!", uuid, 'enqueue_margin_phase')
+        log(job, "\tFound contigs: {}".format(margin_phase_contigs), uuid, 'enqueue_margin_phase')
+        log(job, "\tMissing contigs: {}.".format(missing_margin_phase_contigs), uuid, 'enqueue_margin_phase')
+        log(job, "\tAll ref contigs: {}. ".format(all_ref_contigs), uuid, 'enqueue_margin_phase')
+
+    # prep for marginPhase enqueue
+    margin_phase_samples = [margin_phase_sample_map[c] for c in margin_phase_contigs]
+
+    # add params to everything
+    mp_params_location = os.path.join(work_dir, "{}.mp_params.json".format(uuid))
+    write_margin_phase_params(mp_params_location)
+    if config.intermediate_file_location is not None:
+        copy_files(file_paths=[mp_params_location], output_dir=config.intermediate_file_location)
+    mp_params_fileid = job.fileStore.writeGlobalFile(mp_params_location)
+    for mps in margin_phase_samples:
+        mps.append("{}{}".format(TOIL_JOBSTORE_PROTOCOL, mp_params_fileid))
+
+    # get job configuration
+    margin_phase_config = argparse.Namespace(**{
+        'output_dir': None, #should not be used
+        'partition_size': 2000000,
+        'partition_margin': 50000,
+        'intermediate_file_location': config.intermediate_file_location,
+        'margin_phase_image': DOCKER_MARGIN_PHASE_IMG_DEFAULT,
+        'margin_phase_tag': DOCKER_MARGIN_PHASE_TAG_DEFAULT,
+        'cpecan_image': DOCKER_CPECAN_IMG_DEFAULT,
+        'cpecan_tag': DOCKER_CPECAN_TAG_DEFAULT,
+        'minimal_output': True,
+        'minimal_cpecan_output': True,
+        'cpecan_probabilities': True,
+        'maxCores': config.maxCores,
+        'maxDisk': config.maxDisk,
+        'maxMemory': config.maxMemory,
+    })
+
+    # prep for return values
+    margin_phase_rvs = list()
+
+    # enqueue jobs
+    for mps in margin_phase_samples:
+        log(job, "Enqueing MP job: {}".format(mps), uuid, 'enqueue_margin_phase')
+        mp_job = job.addChildJobFn(mp_prepare_input, mps, margin_phase_config, False)
+        margin_phase_rvs.append(mp_job.rv())
+
+    # enqueue consolidation job
+    cmp_job = job.addFollowOnJobFn(consolidate_margin_phase_jobs, config, job_data, margin_phase_rvs)
+
+    # log
+    log_generic_job_debug(job, uuid, 'enqueue_margin_phase', work_dir=work_dir)
+    log_time(job, "enqueue_margin_phase", start, uuid)
+    return cmp_job.rv()
+
+
+def write_margin_phase_params(file_location):
+    with open(file_location, 'w') as out:
+        out.write('{"alphabet":["Aa","Cc","Gg","Tt","-"],"wildcard":"Nn","haplotypeSubstitutionModel":[0.9993,0.0001,'
+                  '0.0004,0.0001,0.0001,0.0001,0.9993,0.0001,0.0004,0.0001,0.0004,0.0001,0.9993,0.0001,0.0001,0.0001,'
+                  '0.0004,0.0001,0.9993,0.0001,0.0001,0.0001,0.0001,0.0001,0.9996],"readErrorModel":[0.95956038,'
+                  '0.00768823,0.02313562,0.00951578,0.00009999,0.01216431,0.94530676,0.00747140,0.03495754,0.00009999,'
+                  '0.03353173,0.00747909,0.94699127,0.01189791,0.00009999,0.00950825,0.02377039,0.00805501,0.95856636,'
+                  '0.00009999,0.00961502,0.00961502,0.00961502,0.00961502,0.96153992],"maxNotSumTransitions":true,'
+                  '"minPartitionsInAColumn":100,"maxPartitionsInAColumn":100,"minPosteriorProbabilityForPartition":0.0,'
+                  '"maxCoverageDepth":64,"minReadCoverageToSupportPhasingBetweenHeterozygousSites":2,'
+                  '"onDiagonalReadErrorPseudoCount":1000,"offDiagonalReadErrorPseudoCount":10,"trainingIterations":0,'
+                  '"estimateReadErrorProbsEmpirically":false,"filterBadReads":false,"filterMatchThreshold":0.8,'
+                  '"useReferencePrior":true,"includeInvertedPartitions":true,"filterLikelyHomozygousSites":true,'
+                  '"minSecondMostFrequentBaseFilter":0,"minSecondMostFrequentBaseLogProbFilter":20,'
+                  '"gapCharactersForDeletions":false,"filterAReadWithAnyOneOfTheseSamFlagsSet":3840,"compareVCFs":false,'
+                  '"writeGVCF":false,"roundsOfIterativeRefinement":10,"verbose":0}\n')
+
+
+def consolidate_margin_phase_jobs(job, config, job_data, margin_phase_rvs):
+    # prep
+    start = time.time()
+    uuid = config.uuid
+    work_dir = job.tempDir
+
+    # log that it worked
+    log(job, "Job Data: {}".format(job_data), uuid, 'consolidate_margin_phase_jobs')
+    for i, mprv in enumerate(margin_phase_rvs):
+        log(job, "MP Result {}: {}".format(i, mprv), uuid, 'consolidate_margin_phase_jobs')
+
+    # log
+    log_generic_job_debug(job, uuid, 'consolidate_margin_phase_jobs', work_dir=work_dir)
+    log_time(job, "consolidate_margin_phase_jobs", start, uuid)
 
 
 def consolidate_output(job, config, job_data_list):
@@ -480,37 +603,6 @@ def docker_alignqc(job, config, work_dir, bam_filename, ref_filename, output_fil
 
     # return output location
     return output_filename
-
-
-def docker_samtools_sort(job, config, work_dir, input_filename, output_filename=None, extra_args=None):
-    # prep
-    data_location = os.path.join("/data", input_filename)
-    args = [data_location, "-@", str(job.cores)]
-    if extra_args is not None:
-        duplicated_args = list(filter(lambda x: x in args, extra_args))
-        if len(duplicated_args) > 0:
-            log(job, "Duplicated args in call to samtools_sort: {}".format(duplicated_args), config.uuid,
-                'samtools_sort')
-        args.extend(extra_args)
-
-    # call
-    docker_call(job, config, work_dir, args, DOCKER_SAMTOOLS_SORT_IMG, DOCKER_SAMTOOLS_SORT_TAG)
-
-    # loggit
-    log_file = os.path.join(work_dir, DOCKER_SAMTOOLS_SORT_LOG)
-    log_debug_from_docker(job, log_file, config.uuid, 'samtools_sort',
-                          input_file_locations=[os.path.join(work_dir, input_filename)])
-
-    # sanity check
-    require_docker_file_output(job, config, work_dir, [DOCKER_SAMTOOLS_SORT_OUT], 'samtools_sort',
-                               DOCKER_SAMTOOLS_SORT_LOG)
-
-    # rename file to appropriate output
-    if output_filename is not None:
-        os.rename(os.path.join(work_dir, DOCKER_SAMTOOLS_SORT_OUT), os.path.join(work_dir, output_filename))
-        return output_filename
-    else:
-        return DOCKER_SAMTOOLS_SORT_OUT
 
 
 def docker_samtools_sort(job, config, work_dir, input_filename, output_filename=None, extra_args=None):
