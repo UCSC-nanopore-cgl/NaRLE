@@ -34,7 +34,8 @@ from toil_marginphase.marginphase_pipeline import prepare_input as mp_prepare_in
 from toil_marginphase.marginphase_pipeline import run_margin_phase as mp_run_margin_phase
 from toil_marginphase.marginphase_pipeline import merge_chunks as mp_merge_chunks
 from toil_marginphase.marginphase_core import DOCKER_CPECAN_IMG_DEFAULT, DOCKER_CPECAN_TAG_DEFAULT, \
-    DOCKER_MARGIN_PHASE_IMG_DEFAULT, DOCKER_MARGIN_PHASE_TAG_DEFAULT, TOIL_JOBSTORE_PROTOCOL
+    DOCKER_MARGIN_PHASE_IMG_DEFAULT, DOCKER_MARGIN_PHASE_TAG_DEFAULT, TOIL_JOBSTORE_PROTOCOL, \
+    CI_CHUNK_INDEX, CI_OUTPUT_FILE_ID, ID_MERGED, CI_UUID
 
 
 
@@ -83,6 +84,10 @@ DOCKER_ALIGNQC_IMG = "tpesout/alignqc"
 DOCKER_ALIGNQC_TAG = "latest"
 DOCKER_ALIGNQC_LOG = "alignqc.log"
 
+DOCKER_RTG_IMG = "tpesout/rtg_tools"
+DOCKER_RTG_TAG = "latest"
+DOCKER_RTG_LOG = "rtg.log"
+
 # resource
 DEFAULT_CPU = 8
 
@@ -106,6 +111,8 @@ JD_RLE_REF_RL = 'rle_ref_rl'
 JD_RAW_BAM = 'raw_bam'
 JD_RLE_BAM = 'rle_bam'
 JD_ALIGNQC = 'alignqc'
+JD_MP_VCF = 'mp_vcf'
+JD_MP_SAM = 'mp_sam'
 
 # file types
 FT_FASTA = ['.fa', '.fasta', '.fa.gz', '.fasta.gz']
@@ -155,7 +162,7 @@ def prepare_input(job, sample, config):
     #ref fasta
     download_url(reference_url, work_dir=work_dir)
     ref_genome_basename = os.path.basename(reference_url)
-    ref_genome_location = os.path.join(work_dir, "RAW.{}.{}".format(uuid, ref_genome_basename))
+    ref_genome_location = os.path.join(work_dir, "{}.original.{}".format(uuid, ref_genome_basename))
     os.rename(os.path.join(work_dir, ref_genome_basename), ref_genome_location)
     ref_genome_fileid = job.fileStore.writeGlobalFile(ref_genome_location)
     ref_genome_size = os.stat(ref_genome_location).st_size
@@ -163,7 +170,7 @@ def prepare_input(job, sample, config):
     # download data
     download_url(data_url, work_dir=work_dir)
     fastq_basename = os.path.basename(data_url)
-    fastq_location = os.path.join(work_dir, "RAW.{}.{}".format(uuid, fastq_basename))
+    fastq_location = os.path.join(work_dir, "{}.original.{}".format(uuid, fastq_basename))
     os.rename(os.path.join(work_dir, fastq_basename), fastq_location)
     fastq_fileid = job.fileStore.writeGlobalFile(fastq_location)
     fastq_size = os.stat(fastq_location).st_size
@@ -180,7 +187,7 @@ def prepare_input(job, sample, config):
     if config.rle_type != RLE_NONE:
         # do the encoding
         ref_rle_basename, ref_rle_rl_basename = docker_napper_rle(job, config, work_dir, os.path.basename(ref_genome_location),
-                                                           "RLE.{}.{}".format(uuid, ref_genome_basename))
+                                                           "{}.rle.{}".format(uuid, ref_genome_basename))
         # get locations
         ref_rle_location = os.path.join(work_dir, ref_rle_basename)
         ref_rle_rl_location = os.path.join(work_dir, ref_rle_rl_basename)
@@ -197,7 +204,7 @@ def prepare_input(job, sample, config):
     if config.rle_type == RLE_PRE_ALIGN:
         # do the encoding
         fastq_rle_basename, fastq_rle_rl_basename = docker_napper_rle(job, config, work_dir, os.path.basename(fastq_location),
-                                                           "RLE.{}.{}".format(uuid, fastq_basename))
+                                                           "{}.rle.{}".format(uuid, fastq_basename))
         # get locations
         fastq_rle_location = os.path.join(work_dir, fastq_rle_basename)
         fastq_rle_rl_location = os.path.join(work_dir, fastq_rle_rl_basename)
@@ -249,18 +256,18 @@ def align(job, config, job_data):
     read_filetype = config.read_filetype
     work_dir = job.tempDir
     rle_input = config.rle_type in [RLE_PRE_ALIGN]
-    rle_identifier = "RLE" if rle_input else "RAW"
+    rle_identifier = "rle" if rle_input else "raw"
 
     # download files
-    input_reads_filename = "{}.{}.{}".format(rle_identifier, uuid, read_filetype)
+    input_reads_filename = "{}.{}.{}".format(uuid, rle_identifier, read_filetype)
     input_reads_location = os.path.join(work_dir, input_reads_filename)
     job.fileStore.readGlobalFile(job_data[JD_RLE_FASTQ if rle_input else JD_RAW_FASTQ], input_reads_location)
-    input_ref_filename = "{}.{}.reference.fa".format(rle_identifier, uuid)
+    input_ref_filename = "{}.{}.reference.fa".format(uuid, rle_identifier)
     input_ref_location = os.path.join(work_dir, input_ref_filename)
     job.fileStore.readGlobalFile(job_data[JD_RLE_REF if rle_input else JD_RAW_REF], input_ref_location)
 
     # do alignment
-    alignment_filename = "{}.{}.unsorted.sam".format(rle_identifier, uuid)
+    alignment_filename = "{}.{}.unsorted.sam".format(uuid, rle_identifier)
     alignment_location = os.path.join(work_dir, alignment_filename)
     docker_minimap2(job, config, work_dir, input_reads_filename, input_ref_filename, output_filename=alignment_filename,
                     kmer_size=18 if rle_input else 15)
@@ -272,7 +279,7 @@ def align(job, config, job_data):
         copy_files(file_paths=[alignment_location, log_location], output_dir=config.intermediate_file_location)
 
     # sort it
-    sorted_aln_filename = "{}.{}.bam".format(rle_identifier, uuid)
+    sorted_aln_filename = "{}.{}.bam".format(uuid, rle_identifier)
     sorted_aln_location = os.path.join(work_dir, sorted_aln_filename)
     docker_samtools_sort(job, config, work_dir, alignment_filename, output_filename=sorted_aln_filename)
     if not os.path.isfile(sorted_aln_location):
@@ -321,18 +328,18 @@ def alignqc(job, config, job_data):
     uuid = config.uuid
     work_dir = job.tempDir
     rle_input = config.rle_type in [RLE_PRE_ALIGN]
-    rle_identifier = "RLE" if rle_input else "RAW"
+    rle_identifier = "rle" if rle_input else "raw"
 
     # download files
-    input_bam_filename = "{}.{}.bam".format(rle_identifier, uuid)
+    input_bam_filename = "{}.{}.bam".format(uuid, rle_identifier)
     input_bam_location = os.path.join(work_dir, input_bam_filename)
     job.fileStore.readGlobalFile(job_data[JD_RLE_BAM if rle_input else JD_RAW_BAM], input_bam_location)
-    input_ref_filename = "{}.{}.ref.fa".format(rle_identifier, uuid)
+    input_ref_filename = "{}.{}.ref.fa".format(uuid, rle_identifier)
     input_ref_location = os.path.join(work_dir, input_ref_filename)
     job.fileStore.readGlobalFile(job_data[JD_RLE_REF if rle_input else JD_RAW_REF], input_ref_location)
 
     # do alignqc
-    alignqc_filename = "{}.{}.alignqc.xhtml".format(rle_identifier, uuid)
+    alignqc_filename = "{}.{}.alignqc.xhtml".format(uuid, rle_identifier)
     alignqc_location = os.path.join(work_dir, alignqc_filename)
     success = docker_alignqc(job, config, work_dir, input_bam_filename, input_ref_filename, alignqc_filename)
     log_generic_job_debug(job, uuid, 'alignqc', work_dir=work_dir)
@@ -365,13 +372,13 @@ def enqueue_margin_phase(job, config, job_data):
     uuid = config.uuid
     work_dir = job.tempDir
     rle_input = config.rle_type in [RLE_PRE_ALIGN]
-    rle_identifier = "RLE" if rle_input else "RAW"
+    rle_identifier = "rle" if rle_input else "raw"
 
     # download files
-    input_bam_filename = "{}.{}.bam".format(rle_identifier, uuid)
+    input_bam_filename = "{}.{}.bam".format(uuid, rle_identifier)
     input_bam_location = os.path.join(work_dir, input_bam_filename)
     job.fileStore.readGlobalFile(job_data[JD_RLE_BAM if rle_input else JD_RAW_BAM], input_bam_location)
-    input_ref_filename = "{}.{}.ref.fa".format(rle_identifier, uuid)
+    input_ref_filename = "{}.{}.ref.fa".format(uuid, rle_identifier)
     input_ref_location = os.path.join(work_dir, input_ref_filename)
     job.fileStore.readGlobalFile(job_data[JD_RLE_REF if rle_input else JD_RAW_REF], input_ref_location)
 
@@ -383,7 +390,7 @@ def enqueue_margin_phase(job, config, job_data):
     # separate bam into contigs
     margin_phase_sample_map = dict()
     for contig in bam_contigs:
-        bam_contig_filename = "{}.{}.{}.bam".format(rle_identifier, uuid, contig)
+        bam_contig_filename = "{}.{}.{}.bam".format(uuid, rle_identifier, contig)
         docker_samtools_view(job, config, work_dir, input_bam_filename, selection_str=contig,
                              output_filename=bam_contig_filename)
 
@@ -405,7 +412,7 @@ def enqueue_margin_phase(job, config, job_data):
             if config.intermediate_file_location is not None:
                 copy_files(file_paths=[location], output_dir=config.intermediate_file_location)
             ref_contig_fileid = job.fileStore.writeGlobalFile(location)
-            margin_phase_sample_map[contig].append("{}{}".format(TOIL_JOBSTORE_PROTOCOL, bam_contig_fileid))
+            margin_phase_sample_map[contig].append("{}{}".format(TOIL_JOBSTORE_PROTOCOL, ref_contig_fileid))
 
         # data we need to track
         contig_name = None
@@ -429,7 +436,7 @@ def enqueue_margin_phase(job, config, job_data):
                     # intialize new data (if appropriate)
                     if contig_name in margin_phase_sample_map:
                         ref_contig_location = os.path.join(work_dir, "{}.{}.{}.ref.fa".format(
-                            rle_identifier, uuid, contig_name))
+                            uuid, rle_identifier, contig_name))
                         ref_contig_out = open(ref_contig_location, 'w')
 
                 # write header or line if we care about contig
@@ -532,15 +539,80 @@ def consolidate_margin_phase_jobs(job, config, job_data, margin_phase_rvs):
     start = time.time()
     uuid = config.uuid
     work_dir = job.tempDir
+    rle_input = config.rle_type in [RLE_PRE_ALIGN]
+    rle_identifier = "rle" if rle_input else "raw"
 
-    # log that it worked
-    log(job, "Job Data: {}".format(job_data), uuid, 'consolidate_margin_phase_jobs')
-    for i, mprv in enumerate(margin_phase_rvs):
-        log(job, "MP Result {}: {}".format(i, mprv), uuid, 'consolidate_margin_phase_jobs')
+    # organize mp contigs
+    mp_contig_tarballs = dict()
+    for mprv in margin_phase_rvs:
+        contig_uuid = "[missing]" if len(mprv) == 0 else mprv[0][CI_UUID]
+        merged_files = list(filter(lambda x: x[CI_CHUNK_INDEX] == ID_MERGED, mprv))
+        if len(merged_files) != 1:
+            log(job, "Found {} merged files from {} marginPhase run".format(len(merged_files), contig_uuid))
+            continue
+        contig = contig_uuid.replace("{}.".format(uuid), '', 1)
+        mp_contig_tarballs[contig] = merged_files[0][CI_OUTPUT_FILE_ID]
+    log(job, "Got {}/{} merged tarballs from MarginPhase".format(len(mp_contig_tarballs), len(margin_phase_rvs)),
+        uuid, 'consolidate_margin_phase_jobs')
+
+    # prep for untarring
+    untar_work_dir = os.path.join(work_dir, "untar")
+    vcf_work_dir = os.path.join(work_dir, "vcf")
+    sam_work_dir = os.path.join(work_dir, "sam")
+    [os.mkdir(x) for x in [untar_work_dir, vcf_work_dir, sam_work_dir]]
+    vcf_filenames = list()
+    sam_filenames = list()
+
+    # get untarred files
+    for contig in mp_contig_tarballs.keys():
+        contig_work_dir = os.path.join(untar_work_dir, contig)
+        os.mkdir(contig_work_dir)
+        tarball_filename = "{}.{}.tar.gz".format(uuid, contig)
+        tarball_location = os.path.join(contig_work_dir, tarball_filename)
+        job.fileStore.readGlobalFile(mp_contig_tarballs[contig], tarball_location)
+        with tarfile.open(tarball_location) as tar:
+            tar.extractall(path=contig_work_dir)
+        for file in glob.glob(os.path.join(contig_work_dir, '*')):
+            file_basename = os.path.basename(file)
+            if file.endswith(".vcf"):
+                os.rename(file, os.path.join(vcf_work_dir, file_basename))
+                vcf_filenames.append(file_basename)
+            elif file.endswith(".sam"):
+                os.rename(file, os.path.join(sam_work_dir, file_basename))
+                sam_filenames.append(file_basename)
+            elif not file.endswith(".tar.gz"):
+                log(job, "Unexpected file in {}: {}".format(tarball_filename, file_basename),
+                    uuid, 'consolidate_margin_phase_jobs')
+        shutil.rmtree(contig_work_dir)
+
+    # merge vcf
+    merged_vcf_filename = "{}.{}.marginPhase.vcf.gz".format(uuid, rle_identifier)
+    merged_vcf_location = os.path.join(vcf_work_dir, merged_vcf_filename)
+    docker_merge_vcfs(job, config, vcf_work_dir, vcf_filenames, merged_vcf_filename)
+    if config.intermediate_file_location is not None:
+        log_location = os.path.join(vcf_work_dir, "rtg_vcf_merge.{}.log".format(merged_vcf_filename))
+        os.rename(os.path.join(vcf_work_dir, DOCKER_RTG_LOG), log_location)
+        copy_files(file_paths=[merged_vcf_location, log_location], output_dir=config.intermediate_file_location)
+    merged_vcf_fileid = job.fileStore.writeGlobalFile(merged_vcf_location)
+    job_data[JD_MP_VCF] = merged_vcf_fileid
+    log(job, "Merged {} VCF files into {}".format(len(vcf_filenames), merged_vcf_filename),
+        uuid, 'consolidate_margin_phase_jobs')
+
+    # merge sam
+    merged_sam_filename = "{}.{}.marginPhase.sam".format(uuid, rle_identifier)
+    merged_sam_location = os.path.join(sam_work_dir, merged_sam_filename)
+    docker_samtools_merge(job, config, sam_work_dir, sam_filenames, merged_sam_filename)
+    if config.intermediate_file_location is not None:
+        copy_files(file_paths=[merged_sam_location], output_dir=config.intermediate_file_location)
+    merged_sam_fileid = job.fileStore.writeGlobalFile(merged_sam_location)
+    job_data[JD_MP_SAM] = merged_sam_fileid
+    log(job, "Merged {} SAM files into {}".format(len(sam_filenames), merged_sam_filename),
+        uuid, 'consolidate_margin_phase_jobs')
 
     # log
     log_generic_job_debug(job, uuid, 'consolidate_margin_phase_jobs', work_dir=work_dir)
     log_time(job, "consolidate_margin_phase_jobs", start, uuid)
+    return job_data
 
 
 def consolidate_output(job, config, job_data_list):
@@ -658,6 +730,41 @@ def docker_samtools_view(job, config, work_dir, input_filename, selection_str=No
         return DOCKER_SAMTOOLS_VIEW_OUT
 
 
+def docker_samtools_view(job, config, work_dir, input_filename, selection_str=None, output_filename=None):
+    # prep
+    data_location = os.path.join("/data", input_filename)
+    args = ['-hb', data_location]
+    if selection_str is not None:
+        args.append(selection_str)
+
+    # call
+    docker_call(job, config, work_dir, args, DOCKER_SAMTOOLS_VIEW_IMG, DOCKER_SAMTOOLS_VIEW_TAG)
+
+    # sanity check
+    require_docker_file_output(job, config, work_dir, [DOCKER_SAMTOOLS_VIEW_OUT], 'samtools_view',
+                               DOCKER_SAMTOOLS_VIEW_LOG)
+
+    # rename file to appropriate output
+    if output_filename is not None:
+        os.rename(os.path.join(work_dir, DOCKER_SAMTOOLS_VIEW_OUT), os.path.join(work_dir, output_filename))
+        return output_filename
+    else:
+        return DOCKER_SAMTOOLS_VIEW_OUT
+
+
+def docker_samtools_merge(job, config, work_dir, sam_input_filenames, sam_output_filename):
+    # prep
+    data_input_names = [os.path.join("/data", sam) for sam in sam_input_filenames]
+    data_output_name = os.path.join("/data", sam_output_filename)
+    args = ['merge', '--output-fmt', 'SAM', '-@', str(job.cores), data_output_name]
+    args.extend(data_input_names)
+
+    # call
+    docker_call(job, config, work_dir, args, DOCKER_SAMTOOLS_IMG, DOCKER_SAMTOOLS_TAG)
+
+    # sanity check
+    require_docker_file_output(job, config, work_dir, [sam_output_filename], 'samtools_merge')
+
 
 def docker_minimap2(job, config, work_dir, input_filename, ref_filename, output_filename=None, kmer_size=15, extra_args=None):
     # prep
@@ -734,6 +841,29 @@ def docker_get_contig_names(job, config, work_dir, bam_filename):
         raise UserError("Could not find contigs in {}".format(bam_filename))
 
     return contigs
+
+
+def docker_merge_vcfs(job, config, work_dir, vcf_input_names, vcf_output_name):
+    # zip and tabix
+    for in_vcf in vcf_input_names:
+        docker_call(job, config, work_dir, ['bgzip', os.path.join("/data", in_vcf)], DOCKER_RTG_IMG, DOCKER_RTG_TAG)
+        docker_call(job, config, work_dir, ['index', os.path.join("/data", "{}.gz".format(in_vcf))], DOCKER_RTG_IMG, DOCKER_RTG_TAG)
+
+    # prep
+    data_input_names = [os.path.join("/data", "{}.gz".format(vcf)) for vcf in vcf_input_names]
+    data_output_name = os.path.join("/data", vcf_output_name)
+    docker_params = ["vcfmerge", '-o', data_output_name]
+    docker_params.extend(data_input_names)
+
+    # call
+    docker_call(job, config, work_dir, docker_params, DOCKER_RTG_IMG, DOCKER_RTG_TAG)
+
+    # loggit
+    log_debug_from_docker(job, os.path.join(work_dir, DOCKER_RTG_LOG), config.uuid, 'rtg_merge_vcfs',
+                          input_file_locations=[os.path.join(work_dir, "{}.gz".format(vcf)) for vcf in vcf_input_names])
+
+    # sanity check
+    require_docker_file_output(job, config, work_dir, [vcf_output_name], 'rtg_merge_vcfs', DOCKER_RTG_LOG)
 
 
 def docker_napper_rle(job, config, work_dir, filename, output_filename=None, type=None):
