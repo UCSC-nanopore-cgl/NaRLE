@@ -20,6 +20,6 @@ else
 fi
 
 # gather time and memory statistics, save everything to 'rle.log'
-echo -e "/usr/bin/time -f '\\\\nDEBUG_MAX_MEM:%M\\\\nDEBUG_RUNTIME:%E\\\\n' $TOOL ${@:2}\n" > /data/napper.log
+echo "/usr/bin/time -f '\\\\nDEBUG_MAX_MEM:%M\\\\nDEBUG_RUNTIME:%E\\\\n' $TOOL ${@:2}\n" > /data/napper.log
 eval "/usr/bin/time -f '\\nDEBUG_MAX_MEM:%M\\nDEBUG_RUNTIME:%E\\n' $TOOL ${@:2}" 2>&1 | tee -a /data/napper.log
 

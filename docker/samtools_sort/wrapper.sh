@@ -23,6 +23,6 @@ else
 fi
 
 # gather time and memory statistics, save everything to 'rle.log'
-echo -e "$INPUT_PIPE | /usr/bin/time -f '\\\\nDEBUG_MAX_MEM:%M\\\\nDEBUG_RUNTIME:%E\\\\n' samtools sort ${@:2} | samtools view -hb >/data/samtools_sort.bam\n" > /data/samtools_sort.log
+echo "$INPUT_PIPE | /usr/bin/time -f '\\\\nDEBUG_MAX_MEM:%M\\\\nDEBUG_RUNTIME:%E\\\\n' samtools sort ${@:2} | samtools view -hb >/data/samtools_sort.bam\n" > /data/samtools_sort.log
 eval "$INPUT_PIPE | /usr/bin/time -f '\\nDEBUG_MAX_MEM:%M\\nDEBUG_RUNTIME:%E\\n' samtools sort ${@:2} | samtools view -hb >/data/samtools_sort.bam" 2>&1 | tee -a /data/samtools_sort.log
 
