@@ -8,3 +8,5 @@ manifest*.tsv
 *.tbi
 *.log
 *.egg-info
+*.jar
+docker/rtg_tools/runtime/LICENSE.TXT
