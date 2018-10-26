@@ -35,7 +35,7 @@ from toil_marginphase.marginphase_pipeline import run_margin_phase as mp_run_mar
 from toil_marginphase.marginphase_pipeline import merge_chunks as mp_merge_chunks
 from toil_marginphase.marginphase_core import DOCKER_CPECAN_IMG_DEFAULT, DOCKER_CPECAN_TAG_DEFAULT, \
     DOCKER_MARGIN_PHASE_IMG_DEFAULT, DOCKER_MARGIN_PHASE_TAG_DEFAULT, TOIL_JOBSTORE_PROTOCOL, \
-    CI_CHUNK_INDEX, CI_OUTPUT_FILE_ID, ID_MERGED, CI_UUID
+    CI_CHUNK_INDEX, CI_OUTPUT_FILE_ID, ID_MERGED, CI_UUID, TAG_HAPLOTYPE, percent
 
 
 
@@ -113,6 +113,12 @@ JD_RLE_BAM = 'rle_bam'
 JD_ALIGNQC = 'alignqc'
 JD_MP_VCF = 'mp_vcf'
 JD_MP_SAM = 'mp_sam'
+
+# haplotyped sam
+HS_CHROM = 'chrom'
+HS_PHASE_BLOCK = 'phase_block'
+HS_HAP1_FILEID = 'h1_fid'
+HS_HAP2_FILEID = 'h2_fid'
 
 # file types
 FT_FASTA = ['.fa', '.fasta', '.fa.gz', '.fasta.gz']
@@ -612,6 +618,177 @@ def consolidate_margin_phase_jobs(job, config, job_data, margin_phase_rvs):
     # log
     log_generic_job_debug(job, uuid, 'consolidate_margin_phase_jobs', work_dir=work_dir)
     log_time(job, "consolidate_margin_phase_jobs", start, uuid)
+    return job_data
+
+
+def split_haplotyped_sam(job, config, job_data):
+    HS_CHROM = 'chrom'
+    HS_PHASE_BLOCK = 'phase_block'
+    HS_HAP1_FILEID = 'h1_fid'
+    HS_HAP2_FILEID = 'h2_fid'
+
+    # prep
+    start = time.time()
+    uuid = config.uuid
+    work_dir = job.tempDir
+    sam_work_dir = os.path.join(work_dir, 'split_sams')
+    os.mkdir(sam_work_dir)
+    rle_input = config.rle_type in [RLE_PRE_ALIGN]
+    rle_identifier = "rle" if rle_input else "raw"
+
+    # get marginPhase'd sam files
+    haplotyped_sam_filename = "{}.{}.marginPhase.sam".format(uuid, rle_identifier)
+    haplotyped_sam_location = os.path.join(work_dir, haplotyped_sam_filename)
+    job.fileStore.readGlobalFile(job_data[JD_MP_SAM], haplotyped_sam_location)
+
+    # get sam header
+    haplotyped_header_filename = "{}.{}.marginPhase.header.txt".format(uuid, rle_identifier)
+    haplotyped_header_location = os.path.join(work_dir, haplotyped_header_filename)
+    with open(haplotyped_header_location, 'w') as output, open(haplotyped_sam_location, 'r') as input:
+        for line in input:
+            if line.startswith("@"):
+                output.write(line)
+            else:
+                break
+
+    # tracking for current phase blocks
+    phase_block_files = dict()
+    current_chrom = set()
+    HAP1 = '1'
+    HAP2 = '2'
+    H1_OUT = '1.o'
+    H2_OUT = '2.o'
+
+    ### helper functions ###
+    # this creates new files and file handles (closed when new chrom is encountered)
+    def init_new_phase_block_files(chrom, phase_block):
+        hap1_location = os.path.join(sam_work_dir, "{}.{}.{}.{}.1.sam".format(uuid, rle_identifier, chrom, phase_block))
+        hap2_location = os.path.join(sam_work_dir, "{}.{}.{}.{}.2.sam".format(uuid, rle_identifier, chrom, phase_block))
+        shutil.copy(haplotyped_header_location, hap1_location)
+        shutil.copy(haplotyped_header_location, hap2_location)
+        phase_block_files[chrom][phase_block] = {
+            HAP1: hap1_location,
+            HAP2: hap2_location,
+            H1_OUT: open(hap1_location, 'w'),
+            H2_OUT: open(hap2_location, 'w'),
+        }
+    # closes all open file handles for chromosome
+    def close_phase_block_chrom(chrom):
+        if chrom is None: return
+        for pb in phase_block_files[chrom].values():
+            if pb[H1_OUT] is not None:
+                pb[H1_OUT].close()
+                pb[H1_OUT] = None
+            if pb[H2_OUT] is not None:
+                pb[H2_OUT].close()
+                pb[H2_OUT] = None
+    # writes read to appropriate file handle (and creates if necessary
+    def handle_phase_block_read(chrom, phase_block, is_hap1, line):
+        # ensure chrom is accounted for
+        if chrom not in current_chrom:
+            [close_phase_block_chrom(c) for c in current_chrom]
+            if chrom in phase_block_files:
+                error = "Found read for inactive chrom {}! Handled: {}, current: {}".format(
+                    chrom, phase_block_files.keys(), current_chrom)
+                log(job, error, uuid, 'split_haplotyped_sam')
+                raise UserError(error)
+            phase_block_files[chrom] = dict()
+            current_chrom.clear()
+            current_chrom.add(chrom)
+        # ensure phaseblock is accounted for
+        if phase_block not in phase_block_files[chrom]:
+            init_new_phase_block_files(chrom, phase_block)
+        # write
+        phase_block_files[chrom][phase_block][H1_OUT if is_hap1 else H2_OUT].write(line)
+    # parse read and get phase block info
+    def get_phase_blocks_from_read_line(line):
+        # prep
+        phase_blocks = list()
+        line = line.rstrip().split("\t")
+        read_id = line[0]
+        chrom = line[2]
+        # look for haplotype tag in all tags
+        for tag in line[11:]:
+            if not tag.startswith(TAG_HAPLOTYPE):
+                continue
+            # get the haplotype encodings
+            tag = tag.split(":")
+            encoded_pb = tag[2]
+            for epb_part in encoded_pb.split(";"):
+                epb_part = epb_part.split(",")
+                # haplotype is 0 to indicate not happed, otherwise 1 or 2
+                hap = int(epb_part[0].replace('h', ''))
+                if hap not in [0,1,2]:
+                    error = "Got unexpected haplotype tag in read {}: {}".format(read_id, encoded_pb)
+                    log(job, error, uuid, 'split_haplotyped_sam')
+                    raise UserError(error)
+                if hap == 0:
+                    continue
+                is_hap1 = hap == 1
+                # get phase block
+                pb = int(epb_part[1].replace('p',''))
+                # save relevant information
+                phase_blocks.append([chrom, pb, is_hap1])
+        # this may be empty
+        return phase_blocks
+
+    # having defined all the hard work above, now we just organize all reads in the sam file
+    total_read_cnt = 0
+    unphased_read_cnt = 0
+    success = False
+    try:
+        with open(haplotyped_sam_location, 'r') as input:
+            for line in input:
+                # skip header lines
+                if line.startswith("@"): continue
+                # get phase blocks
+                phase_blocks = get_phase_blocks_from_read_line(line)
+                if len(phase_blocks) == 0:
+                    unphased_read_cnt += 1
+                for phase_block in phase_blocks:
+                    chrom, phase_block, is_hap1 = phase_block
+                    handle_phase_block_read(chrom, phase_block, is_hap1, line)
+                total_read_cnt += 1
+        success = True
+    finally:
+        # close the last set of files
+        for chrom in current_chrom:
+            close_phase_block_chrom(chrom)
+        # lgogit
+        log(job, "{} split haplotyped sam into {} phase blocks over {} contigs.".format(
+            "Successfully" if success else "Failed", len(phase_block_files), sum(map(len, phase_block_files.values()))),
+            uuid, 'split_haplotyped_sam')
+        log(job, "Of {} total reads, {} were unphased".format(total_read_cnt, unphased_read_cnt,
+                                                              percent(unphased_read_cnt, total_read_cnt)),
+            uuid, 'split_haplotyped_sam')
+
+    # set up intermediate savings
+    if config.intermediate_file_location is not None:
+        new_intermediate_location = os.path.join(config.intermediate_file_location, 'haplotyped_sams')
+        os.mkdir(new_intermediate_location)
+        def save_intermediate_file(file):
+            copy_files(file_paths=[file], output_dir=new_intermediate_location)
+    else:
+        def save_intermediate_file(file):
+            pass
+
+    # save new files
+    all_haplotyped_sams = list()
+    for chrom in phase_block_files.keys():
+        for phase_block in phase_block_files[chrom].keys():
+            pb_sam_data = {
+                HS_CHROM: chrom,
+                HS_PHASE_BLOCK: phase_block,
+            }
+            save_intermediate_file(phase_block_files[chrom][phase_block][HAP1])
+            save_intermediate_file(phase_block_files[chrom][phase_block][HAP2])
+            pb_sam_data[HS_HAP1_FILEID] = job.filestore.writeGlobalFile(phase_block_files[chrom][phase_block][HAP1])
+            pb_sam_data[HS_HAP2_FILEID] = job.filestore.writeGlobalFile(phase_block_files[chrom][phase_block][HAP2])
+            all_haplotyped_sams.append(pb_sam_data)
+
+    # log
+    log_generic_job_debug(job, config.uuid, 'split_haplotyped_sam', work_dir=work_dir)
+    log_time(job, "split_haplotyped_sam", start, uuid)
     return job_data
 
 
