@@ -18,5 +18,5 @@ required_versions = {'toil': '==3.17.0',
                      'toil-lib': '==1.1.8',
                      'bd2k-python-lib': '==1.14a1.dev48',
                      'pyyaml': '>=3.11',
-                     'azure': '==2.0',
+                     # 'azure': '==2.0',
                      'pysam': '==0.14.1'}

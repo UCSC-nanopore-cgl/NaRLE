@@ -9,7 +9,7 @@ RUN apt-get update && apt-get -y install git make gcc g++ time zlib1g-dev && \
     apt-get purge && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# get napper
+# get minimap
 WORKDIR /opt
 RUN git clone https://github.com/lh3/minimap2.git && \
     cd /opt/minimap2 && \
