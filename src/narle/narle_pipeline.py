@@ -65,7 +65,7 @@ DOCKER_MARGIN_POLISH_IMG = "tpesout/margin_polish"
 DOCKER_MARGIN_POLISH_TAG = "latest"
 DOCKER_MARGIN_POLISH_LOG = "marginPolish.log"
 
-DOCKER_CUSTOM_STATS_IMG = "tpesout/custom_assembly_stats"
+DOCKER_CUSTOM_STATS_IMG = "tpesout/custom_assembly_stats2"
 DOCKER_CUSTOM_STATS_TAG = "latest"
 DOCKER_CUSTOM_STATS_LOG = "custom_assembly_stats.log"
 
@@ -74,7 +74,7 @@ DOCKER_RTG_TAG = "latest"
 DOCKER_RTG_LOG = "rtg.log"
 
 # resource
-DEFAULT_CPU = 8
+# DEFAULT_CPU = 8
 
 # assembly
 ASM_READS_MEM_FACTOR = 1
@@ -135,17 +135,26 @@ def prepare_input(job, sample, config):
     uuid, reads_url, assembly_url = sample
     config.uuid = uuid
     config.read_filetype = NUCL_FASTA if is_fasta(reads_url) else (NUCL_FASTQ if is_fastq(reads_url) else None)
+    work_dir = job.tempDir
+
+    # set up output dir
+    config.output_dir = os.path.join(config.output_dir, uuid)
+    if urlparse(config.output_dir).scheme != "s3":
+        mkdir_p(config.output_dir)
+
+    # set up intermediate dir
     if config.intermediate_file_location is not None:
         config.intermediate_file_location = os.path.join(config.intermediate_file_location, uuid)
         mkdir_p(config.intermediate_file_location)
-    work_dir = job.tempDir
+
+    # loggit
     log(job, "START:{}".format(datetime.datetime.now()), uuid)
     log(job, "Preparing input with reads_url:{}, assembly_url:{}".format(reads_url, assembly_url),
         uuid, "prepare_input")
 
     # resource estimation
     config.maxCores = min(config.maxCores, multiprocessing.cpu_count())
-    config.defaultCores = min(DEFAULT_CPU, config.maxCores)
+    config.defaultCores = config.maxCores #min(DEFAULT_CPU, config.maxCores)
     config.maxMemory = min(config.maxMemory, int(physicalMemory() * .95))
     config.maxDisk = min(config.maxDisk, int(physicalDisk(None, toilWorkflowDir=work_dir) * .95))
 
@@ -296,10 +305,13 @@ def align(job, config, job_data, ref_in_descriptor, align_out_descriptor):
     docker_samtools_sort(job, config, work_dir, alignment_filename, output_filename=sorted_aln_filename)
     if not os.path.isfile(sorted_aln_location):
         raise UserError("Sorted alignment file {} not created for {}".format(sorted_aln_filename, uuid))
+
+    # save it
     if config.intermediate_file_location is not None:
         log_location = os.path.join(work_dir, "samtools_sort.{}.log".format(alignment_filename))
         os.rename(os.path.join(work_dir, DOCKER_SAMTOOLS_SORT_LOG), log_location)
         copy_files(file_paths=[sorted_aln_location, log_location], output_dir=config.intermediate_file_location)
+    move_or_upload(job, config, [sorted_aln_location])
 
     # save to jobstore
     sorted_aln_fileid = job.fileStore.writeGlobalFile(sorted_aln_location)
@@ -333,10 +345,12 @@ def gather_assembly_stats(job, config, job_data, assembly_in_descriptor, stats_o
                                                  "{}.custom_assembly_stats.{}".format(uuid, assembly_in_descriptor))
 
     # handle file
+    stats_tarball = os.path.join(work_dir, stats_tarball)
     if config.intermediate_file_location is not None:
         log_location = os.path.join(work_dir, "custom_assembly_stats.{}.log".format(assembly_in_descriptor))
         os.rename(os.path.join(work_dir, DOCKER_CUSTOM_STATS_LOG), log_location)
         copy_files(file_paths=[stats_tarball, log_location], output_dir=config.intermediate_file_location)
+    move_or_upload(job, config, [stats_tarball])
     stats_tarball_fileid = job.fileStore.writeGlobalFile(stats_tarball)
     job_data[stats_out_descriptor] = stats_tarball_fileid
 
@@ -370,13 +384,15 @@ def run_margin_polish(job, config, job_data):
                                                      alignment_filename, assembly_filename, params_filename,
                                                      output_base="{}.marginPolish.out".format(uuid))
     polished_assembly_location = os.path.join(work_dir, polished_assembly_filename)
-
     if not os.path.isfile(polished_assembly_location):
         raise UserError("Polished assembly file {} not created for {}".format(polished_assembly_location, uuid))
+
+    # handle file
     if config.intermediate_file_location is not None:
         log_location = os.path.join(work_dir, "marginPolish.log".format(alignment_filename))
         os.rename(os.path.join(work_dir, DOCKER_MARGIN_POLISH_LOG), log_location)
         copy_files(file_paths=[polished_assembly_location, log_location], output_dir=config.intermediate_file_location)
+    move_or_upload(job, config, [polished_assembly_location])
 
     # save to jobstore
     polished_assembly_fileid = job.fileStore.writeGlobalFile(polished_assembly_location)
@@ -395,12 +411,14 @@ def generate_shasta_assembly(job, config, job_data):
     job_data = consolidate_job_data(job, config, job_data, 'generate_shasta_assembly')
     work_dir = job.tempDir
 
-    #TODO
-    log(job, "In generate_shasta_assembly: {}".format(job_data), config.uuid, 'generate_shasta_assembly')
+    log(job, "In generate_shasta_assembly: {}".format(job_data), uuid, 'generate_shasta_assembly')
 
     # log
     log_generic_job_debug(job, uuid, 'generate_shasta_assembly', work_dir=work_dir)
     log_time(job, "generate_shasta_assembly", start, uuid)
+
+    #TODO
+    raise UserError("generate_shasta_assembly is not implemented!")
     return job_data
 
 
@@ -410,8 +428,7 @@ def consolidate_output(job, config, job_data_list):
     uuid = config.uuid
     final_job_data = consolidate_job_data(job, config, job_data_list, "consolidate_output")
 
-    #TODO
-    log(job, "In consolidate_output: {}".format(final_job_data), config.uuid, 'consolidate_output')
+    log(job, "In consolidate_output: {}".format(final_job_data), uuid, 'consolidate_output')
 
     return final_job_data
 
@@ -676,24 +693,26 @@ def docker_custom_assembly_stats(job, config, work_dir, assembly_filename, true_
 
     # loggit
     filename_no_ext = lambda x: '.'.join(os.path.basename(x).split('.')[:-1])
-    output_file_base = "{}/{}_VS_{}".format(output_base, filename_no_ext(assembly_location),
-                                            filename_no_ext(true_ref_filename))
+    output_file_base = "{}_VS_{}".format(filename_no_ext(assembly_location).replace(".", "_"),
+                                            filename_no_ext(true_ref_filename).replace(".", "_"),)
     expected_file_suffixes = ['sam', 'sorted.sam', 'sorted.bam', 'sorted.bam.bai', 'sorted.png']
     output_files = list(map(lambda x: "{}.{}".format(output_file_base, x), expected_file_suffixes))
-    output_files.append("{}/summary_{}_VS_{}.sorted.csv".format(output_base, filename_no_ext(assembly_location),
-                                                                filename_no_ext(true_ref_filename)))
+    output_files.append("summary_{}_VS_{}.sorted.csv".format(filename_no_ext(assembly_location).replace(".", "_"),
+                                                                filename_no_ext(true_ref_filename).replace(".", "_")))
+    output_files = list(map(lambda x: os.path.join(output_base, x), output_files))
     log_debug_from_docker(job, os.path.join(work_dir, DOCKER_CUSTOM_STATS_LOG), config.uuid, 'custom_assembly_stats',
                           input_file_locations=[os.path.join(work_dir, assembly_filename),
                                                 os.path.join(work_dir, true_ref_filename)],
                           output_file_locations=list(map(lambda x: os.path.join(work_dir, x), output_files)))
 
     # sanity check
-    require_docker_file_output(job, config, work_dir, output_files, 'custom_assembly_stats', DOCKER_CUSTOM_STATS_LOG)
+    require_docker_file_output(job, config, work_dir, output_files,
+                               'custom_assembly_stats', DOCKER_CUSTOM_STATS_LOG)
 
     # tarball result
     desired_files = list(filter(lambda x: not x.endswith("sam"), output_files))
     output_tarball = "{}.tar.gz".format(output_base)
-    tarball_files(output_tarball, desired_files, work_dir)
+    tarball_files(output_tarball, list(map(lambda x: os.path.abspath(os.path.join(work_dir, x)), desired_files)), work_dir)
     if not os.path.isfile(os.path.join(work_dir, output_tarball)):
         err = "Failed to create tarball of custom_assembly_stats {}".format(output_tarball)
         log(job, "{}.  Desired files: {}".format(err, desired_files), config.uuid, 'custom_assembly_stats')
@@ -706,6 +725,15 @@ def docker_custom_assembly_stats(job, config, work_dir, assembly_filename, true_
 ###########################################################
 #                 TOIL UTILITY FUNCTIONS                  #
 ###########################################################
+
+
+def move_or_upload(job, config, files, uuid=None, function="move_or_upload"):
+    log(job, "Attempting to save {} to {}".format(files, config.output_dir, uuid, function))
+    if urlparse(config.output_dir).scheme == 's3':
+        for f in files:
+            s3am_upload(fpath=f, s3_dir=config.output_dir)
+    elif urlparse(config.output_dir).scheme != 's3':
+        copy_files(file_paths=files, output_dir=config.output_dir)
 
 
 def docker_call(job, config, work_dir, params, image, tag, detach=False, stdout=None, stderr=None):
@@ -733,8 +761,8 @@ def require_docker_file_output(job, config, work_dir, output_filenames, function
             directory_contents = directory_contents[0:max_directory_contents]
             directory_contents.append("[{} items total]".format(len(directory_contents)))
         log(job, "Current files in work_dir: {}".format(work_dir), config.uuid, function_id)
-        for missing in directory_contents:
-            log(job, "\t{}".format(missing), config.uuid, function_id)
+        for existing in directory_contents:
+            log(job, "\t{}".format(existing), config.uuid, function_id)
 
         # document log
         if log_filename is not None:
@@ -843,17 +871,21 @@ def generate_config():
 
         # Required: Output location of sample. Can be full path to a directory (with or without file:// protocol) or an s3:// URL
         # Warning: S3 buckets must exist prior to upload or it will fail.
-        output-dir: file:///tmp
+        # Notes: files will be grouped by their UUID
+        output-dir: file:///tmp/output
 
         # Required: URL {scheme} for marginPolish parameter file
         margin-params: https://raw.githubusercontent.com/benedictpaten/marginPhase/polisher/params/allParams.np.json
 
         # Optional: URL {scheme} for true FASTA reference. Setting this value will trigger QC data generation
-        # true-reference: http://server.location/of/reference.fa
+        # Example:
+        #   true-reference: http://server.location/of/reference.fa
         true-reference: 
 
-        # Optional: for debugging, this will save intermediate files to the output directory (only works for file:// scheme)
-        save-intermediate-files: False
+        # Optional: intermediate files will be saved to this directory with a job timestamp (only accepts file:// scheme)
+        # Example:
+        #   save-intermediate-files: file:///tmp/intermediate
+        save-intermediate-files: 
 
     """.format(scheme=", ".join([x + '://' for x in SCHEMES])))
 
@@ -986,7 +1018,7 @@ def main():
         parsed_config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
         config = argparse.Namespace(**parsed_config)
         config.maxCores = int(args.maxCores) if args.maxCores else sys.maxsize
-        config.defaultCores = int(min(DEFAULT_CPU, config.maxCores))
+        config.defaultCores = config.maxCores #int(min(DEFAULT_CPU, config.maxCores))
         config.maxDisk = int(args.maxDisk) if args.maxDisk else sys.maxint
         config.maxMemory = sys.maxint
         # fix parsing of GB to int
@@ -1008,9 +1040,9 @@ def main():
         required_config_values = ['output_dir', 'margin_params']
         missing_config_values = list(filter(lambda x: x not in config or parsed_config[x] is None or len(parsed_config[x]) == 0,
                                             required_config_values))
-        # required values
         if len(missing_config_values) != 0:
             raise UserError("Required config values are missing or empty: {}".format(missing_config_values))
+
         # management of output
         if urlparse(config.output_dir).scheme not in [None, "", "file", "s3"]:
             raise UserError("Config parameter 'output-dir' must be file:// or s3:// protocol")
@@ -1019,15 +1051,19 @@ def main():
             mkdir_p(config.output_dir)
         if not config.output_dir.endswith('/'):
             config.output_dir += '/'
+
         # intermediate files
         if 'save_intermediate_files' not in config or not config.save_intermediate_files:
             config.intermediate_file_location = None
-        elif urlparse(config.output_dir).scheme in ["s3"]:
-            raise UserError("Config parameter 'save_intermediate_files' cannot only be used with local (file://) output directory")
+        elif urlparse(config.save_intermediate_files).scheme != 'file':
+            raise UserError("Config parameter 'save_intermediate_files' must be used with local (file://) output directory")
         else:
-            intermediate_location = os.path.join(config.output_dir, "intermediate", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+            intermediate_location = os.path.join(config.save_intermediate_files.replace("file://", "", 1),
+                                                 datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+            if not intermediate_location.endswith('/'): config.output_dir += '/'
             mkdir_p(intermediate_location)
             config.intermediate_file_location = intermediate_location
+
         # margin params configuration
         if urlparse(config.margin_params).scheme not in SCHEMES:
             raise UserError("Margin Params URL {} is missing scheme. Expected: {}".format(config.margin_params, [x + "://" for x in SCHEMES]))

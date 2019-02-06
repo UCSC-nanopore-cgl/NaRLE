@@ -16,7 +16,10 @@ version = '0.0.0a1'
 
 required_versions = {'toil': '==3.17.0',
                      'toil-lib': '==1.1.8',
-                     'bd2k-python-lib': '==1.14a1.dev48',
+                     # 'bd2k-python-lib': '==1.14a1.dev48',
+                     'bd2k-python-lib': '==1.13.dev16',
                      'pyyaml': '>=3.11',
                      # 'azure': '==2.0',
-                     'pysam': '==0.14.1'}
+                     'pysam': '==0.14.1',
+                     'boto3': '==1.9.88',
+                     's3am': '==2.0.1'}

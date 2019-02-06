@@ -1,7 +1,7 @@
 # Definitions
 git_commit ?= $(shell git log --pretty=oneline -n 1 | cut -f1 -d " ")
 version = 1.0.0
-name = tpesout/custom_assembly_stats
+name = tpesout/custom_assembly_stats2
 tag = ${version}--${git_commit}
 
 build:
