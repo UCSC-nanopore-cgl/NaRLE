@@ -34,10 +34,6 @@ from toil_lib.urls import download_url, s3am_upload
 # input / output schemes
 SCHEMES = ('http', 'https', 'file', 's3', 'ftp')
 
-# nucleotide types (for RLE)
-NUCL_FASTA='fasta'
-NUCL_FASTQ='fastq'
-
 # filenames
 DEFAULT_CONFIG_NAME = 'config-toil-nanopore.yaml'
 DEFAULT_MANIFEST_NAME = 'manifest-toil-nanopore.tsv'
@@ -65,9 +61,13 @@ DOCKER_MARGIN_POLISH_IMG = "tpesout/margin_polish"
 DOCKER_MARGIN_POLISH_TAG = "latest"
 DOCKER_MARGIN_POLISH_LOG = "marginPolish.log"
 
-DOCKER_CUSTOM_STATS_IMG = "tpesout/custom_assembly_stats2"
+DOCKER_CUSTOM_STATS_IMG = "tpesout/custom_assembly_stats"
 DOCKER_CUSTOM_STATS_TAG = "latest"
 DOCKER_CUSTOM_STATS_LOG = "custom_assembly_stats.log"
+
+DOCKER_QUAST_IMG = "tpesout/quast"
+DOCKER_QUAST_TAG = "latest"
+DOCKER_QUAST_LOG = "quast.log"
 
 DOCKER_RTG_IMG = "tpesout/rtg_tools"
 DOCKER_RTG_TAG = "latest"
@@ -108,11 +108,16 @@ JD_MARGIN_POLISH_ASSEMBLY_STATS = 'margin_polish_assembly_stats'
 JD_MARGIN_POLISH_PARAMS = 'margin_polish_params'
 
 # file types
-FT_FASTA = ['fa', 'fasta']#, '.fa.gz', '.fasta.gz']
-FT_FASTQ = ['fq', 'fastq']#, '.fq.gz', '.fastq.gz']
-is_type = lambda input, type_suffixes: any(map(lambda t_suffix: input.endswith(t_suffix), type_suffixes))
+FT_FASTA = ['fa', 'fasta']
+FT_FASTQ = ['fq', 'fastq']
+FT_GZ = ['gz']
+is_type = lambda input, type_suffixes: any(map(
+    lambda t_suffix: input.endswith(t_suffix) or
+                     any(map(lambda tz_suffix: input.endswith("{}.{}".format(t_suffix, tz_suffix)), FT_GZ)),
+    type_suffixes))
 is_fasta = lambda input: is_type(input, FT_FASTA)
 is_fastq = lambda input: is_type(input, FT_FASTQ)
+is_zipped = lambda input: is_type(input, FT_GZ)
 
 
 # for debugging
@@ -134,7 +139,9 @@ def prepare_input(job, sample, config):
     config = argparse.Namespace(**vars(config))
     uuid, reads_url, assembly_url = sample
     config.uuid = uuid
-    config.read_filetype = NUCL_FASTA if is_fasta(reads_url) else (NUCL_FASTQ if is_fastq(reads_url) else None)
+    config.read_filetype = FT_FASTA[0] if is_fasta(reads_url) else (FT_FASTQ[0] if is_fastq(reads_url) else None)
+    if is_zipped(reads_url):
+        config.read_filetype = "{}.{}".format(config.read_filetype, FT_GZ[0])
     work_dir = job.tempDir
 
     # set up output dir
@@ -173,6 +180,7 @@ def prepare_input(job, sample, config):
         reads_fa_fileid = reads_fileid
         if config.intermediate_file_location is not None:
             copy_files(file_paths=[reads_location], output_dir=config.intermediate_file_location)
+        raise UserError("FASTA filetype is not supported for input reads (yet)")
     else:
         reads_fq_fileid = reads_fileid
         #TODO convert to fa
@@ -225,26 +233,21 @@ def prepare_input(job, sample, config):
 
     # do we need to enqueue assembly job?
     assembly_job = job
-    align_job_data = job_data
+    assembly_job_data = job_data
     if assembly_url is None:
-
-        # assembly qc
-        if config.true_reference is not None:
-            assembly_stats_job = job.addChildJobFn(gather_assembly_stats, config, job_data, JD_ASSEMBLY, JD_ASSEMBLY_STATS, cores=1)
-            return_values.append(assembly_stats_job.rv())
-
         # alignment resource usage
         asm_mem = estimate_asm_mem_usage(reads_size, config)
         asm_dsk = estimate_asm_dsk_usage(reads_size, config)
 
+        # add jobs
         assembly_job = job.addChildJobFn(generate_shasta_assembly, config, job_data,
                                          cores=config.defaultCores, memory=asm_mem, disk=asm_dsk)
-        align_job_data = assembly_job.rv()
+        assembly_job_data = assembly_job.rv()
 
     # enqueue alignment job
     aln_mem = estimate_aln_mem_usage(reads_size, config)
     aln_dsk = estimate_aln_dsk_usage(reads_size, config)
-    assembly_align_job = assembly_job.addChildJobFn(align, config, align_job_data, JD_ASSEMBLY, JD_ASSEMBLY_ALIGN,
+    assembly_align_job = assembly_job.addChildJobFn(align, config, assembly_job_data, JD_ASSEMBLY, JD_ASSEMBLY_ALIGN,
                                        cores=config.defaultCores, memory=aln_mem, disk=aln_dsk)
 
     # enqueue polish job
@@ -254,10 +257,16 @@ def prepare_input(job, sample, config):
                                            cores=config.defaultCores, memory=pol_mem, disk=pol_dsk)
     return_values.append(margin_polish_job.rv())
 
-    # polish stats job
-    margin_polish_stats_job = margin_polish_job.addChildJobFn(gather_assembly_stats, config, margin_polish_job.rv(),
-                                           JD_MARGIN_POLISH_ASSEMBLY, JD_MARGIN_POLISH_ASSEMBLY_STATS, cores=1)
-    return_values.append(margin_polish_stats_job.rv())
+    # assembly qc
+    if config.true_reference is not None:
+        # add for assembly
+        assembly_stats_job = assembly_job.addChildJobFn(gather_assembly_stats, config, assembly_job_data,
+                                                        JD_ASSEMBLY, JD_ASSEMBLY_STATS, cores=1)
+        return_values.append(assembly_stats_job.rv())
+        # add for polishing
+        margin_polish_stats_job = margin_polish_job.addChildJobFn(gather_assembly_stats, config, margin_polish_job.rv(),
+                                                  JD_MARGIN_POLISH_ASSEMBLY, JD_MARGIN_POLISH_ASSEMBLY_STATS, cores=1)
+        return_values.append(margin_polish_stats_job.rv())
 
     # submit final consolidation job
     consolidate_output_job = job.addFollowOnJobFn(consolidate_output, config, return_values)
@@ -341,15 +350,32 @@ def gather_assembly_stats(job, config, job_data, assembly_in_descriptor, stats_o
     # get stats
     log(job, "In gather_assembly_stats: {}->{}, {}".format(assembly_in_descriptor, stats_out_descriptor, job_data),
         config.uuid, 'gather_assembly_stats')
-    stats_tarball = docker_custom_assembly_stats(job, config, work_dir, assembly_filename, true_ref_filename,
-                                                 "{}.custom_assembly_stats.{}".format(uuid, assembly_in_descriptor))
+    custom_stats_files = docker_custom_assembly_stats(job, config, work_dir, assembly_filename, true_ref_filename,
+                                                      "{}.{}.custom_assembly_stats".format(uuid, assembly_in_descriptor))
+    quast_files = docker_quast(job, config, work_dir, assembly_filename, true_ref_filename,
+                              "{}.{}.quast".format(uuid, assembly_in_descriptor),
+                              None if config.quast_params is None else config.quast_params.split())
+
+    # tarball result
+    files_to_tar = []
+    files_to_tar.extend(custom_stats_files)
+    files_to_tar.extend(quast_files)
+    output_tarball = "{}.assembly_stats.{}.tar.gz".format(uuid, assembly_in_descriptor)
+    tarball_files(output_tarball, list(map(lambda x: os.path.abspath(os.path.join(work_dir, x)), files_to_tar)), work_dir)
+    if not os.path.isfile(os.path.join(work_dir, output_tarball)):
+        err = "Failed to create tarball of assembly_stats {}".format(output_tarball)
+        log(job, "{}.  Desired files: {}".format(err, files_to_tar), config.uuid, 'gather_assembly_stats')
+        raise UserError(err)
 
     # handle file
-    stats_tarball = os.path.join(work_dir, stats_tarball)
+    stats_tarball = os.path.join(work_dir, output_tarball)
     if config.intermediate_file_location is not None:
-        log_location = os.path.join(work_dir, "custom_assembly_stats.{}.log".format(assembly_in_descriptor))
-        os.rename(os.path.join(work_dir, DOCKER_CUSTOM_STATS_LOG), log_location)
-        copy_files(file_paths=[stats_tarball, log_location], output_dir=config.intermediate_file_location)
+        cas_log_location = os.path.join(work_dir, "custom_assembly_stats.{}.log".format(assembly_in_descriptor))
+        os.rename(os.path.join(work_dir, DOCKER_CUSTOM_STATS_LOG), cas_log_location)
+        quast_log_location = os.path.join(work_dir, "quast.{}.log".format(assembly_in_descriptor))
+        os.rename(os.path.join(work_dir, DOCKER_QUAST_LOG), quast_log_location)
+        copy_files(file_paths=[stats_tarball, cas_log_location, quast_log_location],
+                   output_dir=config.intermediate_file_location)
     move_or_upload(job, config, [stats_tarball])
     stats_tarball_fileid = job.fileStore.writeGlobalFile(stats_tarball)
     job_data[stats_out_descriptor] = stats_tarball_fileid
@@ -698,8 +724,8 @@ def docker_custom_assembly_stats(job, config, work_dir, assembly_filename, true_
     expected_file_suffixes = ['sam', 'sorted.sam', 'sorted.bam', 'sorted.bam.bai', 'sorted.png']
     output_files = list(map(lambda x: "{}.{}".format(output_file_base, x), expected_file_suffixes))
     output_files.append("summary_{}_VS_{}.sorted.csv".format(filename_no_ext(assembly_location).replace(".", "_"),
-                                                                filename_no_ext(true_ref_filename).replace(".", "_")))
-    output_files = list(map(lambda x: os.path.join(output_base, x), output_files))
+                                                             filename_no_ext(true_ref_filename).replace(".", "_")))
+    output_files = list(map(lambda x: os.path.join(output_base_filename, x), output_files))
     log_debug_from_docker(job, os.path.join(work_dir, DOCKER_CUSTOM_STATS_LOG), config.uuid, 'custom_assembly_stats',
                           input_file_locations=[os.path.join(work_dir, assembly_filename),
                                                 os.path.join(work_dir, true_ref_filename)],
@@ -709,17 +735,48 @@ def docker_custom_assembly_stats(job, config, work_dir, assembly_filename, true_
     require_docker_file_output(job, config, work_dir, output_files,
                                'custom_assembly_stats', DOCKER_CUSTOM_STATS_LOG)
 
-    # tarball result
-    desired_files = list(filter(lambda x: not x.endswith("sam"), output_files))
-    output_tarball = "{}.tar.gz".format(output_base)
-    tarball_files(output_tarball, list(map(lambda x: os.path.abspath(os.path.join(work_dir, x)), desired_files)), work_dir)
-    if not os.path.isfile(os.path.join(work_dir, output_tarball)):
-        err = "Failed to create tarball of custom_assembly_stats {}".format(output_tarball)
-        log(job, "{}.  Desired files: {}".format(err, desired_files), config.uuid, 'custom_assembly_stats')
-        raise UserError(err)
+    # remove sam files
+    for file in filter(lambda x: x.endswith("sam"), output_files):
+        os.remove(os.path.join(work_dir,file))
+
+    # return the base output folder
+    return [output_base_filename]
+
+
+def docker_quast(job, config, work_dir, assembly_filename, true_ref_filename,
+                        output_base=None, extra_args=None):
+    # prep
+    assembly_location = os.path.join("/data", assembly_filename)
+    true_ref_location = os.path.join("/data", true_ref_filename)
+    output_base_filename = "out" if output_base is None else output_base
+    output_base_location = os.path.join("/data", output_base_filename)
+
+    args = ["-o", output_base_location, '-r', true_ref_location]
+    if extra_args is not None:
+        duplicated_args = list(filter(lambda x: x in args, extra_args))
+        if len(duplicated_args) > 0:
+            log(job, "Duplicated args in call to quast: {}".format(duplicated_args), config.uuid,
+                'quast')
+        args.extend(extra_args)
+    args.append(assembly_location)
+
+    # call
+    docker_call(job, config, work_dir, args, DOCKER_QUAST_IMG, DOCKER_QUAST_TAG)
+
+    # loggit
+    expected_files = ['report.pdf', 'report.html'] #todo add more?
+    output_files = list(map(lambda x: os.path.join(output_base, x), expected_files))
+    log_debug_from_docker(job, os.path.join(work_dir, DOCKER_QUAST_LOG), config.uuid, 'quast',
+                          input_file_locations=[os.path.join(work_dir, assembly_filename),
+                                                os.path.join(work_dir, true_ref_filename)],
+                          output_file_locations=list(map(lambda x: os.path.join(work_dir, x), output_files)))
+
+    # sanity check
+    require_docker_file_output(job, config, work_dir, output_files,
+                               'quast', DOCKER_QUAST_LOG)
 
     # return
-    return output_tarball
+    return [output_base]
 
 
 ###########################################################
@@ -881,6 +938,11 @@ def generate_config():
         # Example:
         #   true-reference: http://server.location/of/reference.fa
         true-reference: 
+
+        # Optional: Extra parameters for QUAST execution
+        # Example (recommended for human):
+        #   quast-params: --large
+        quast-params: 
 
         # Optional: intermediate files will be saved to this directory with a job timestamp (only accepts file:// scheme)
         # Example:
@@ -1051,6 +1113,10 @@ def main():
             mkdir_p(config.output_dir)
         if not config.output_dir.endswith('/'):
             config.output_dir += '/'
+
+        # quast params
+        if 'quast_params' not in config or not config.quast_params:
+            config.quast_params = None
 
         # intermediate files
         if 'save_intermediate_files' not in config or not config.save_intermediate_files:
