@@ -340,7 +340,7 @@ def gather_assembly_stats(job, config, job_data, assembly_in_descriptor, stats_o
     work_dir = job.tempDir
 
     # get files
-    assembly_filename = "{}.assembly.fa".format(uuid)
+    assembly_filename = "{}.{}.fa".format(uuid,assembly_in_descriptor)
     assembly_location = os.path.join(work_dir, assembly_filename)
     job.fileStore.readGlobalFile(job_data[assembly_in_descriptor], assembly_location)
     true_ref_filename = "{}.true_ref.fa".format(uuid)
@@ -872,7 +872,27 @@ def log_debug_from_docker(job, log_file_location, identifier, function,
         for line in log_file:
             line = line.strip()
             if line.startswith("DEBUG"):
-                log(job, line, identifier, function)
+                if line.startswith("DEBUG_RUNTIME"):
+                    line_parts = list(map(lambda x: x.strip(), line.split(":")))
+                    try:
+                        if line_parts[0] != 'DEBUG_RUNTIME':
+                            log(job, "Unexpected debug runtime output!", identifier, function)
+                            log(job, line, identifier, function)
+                            continue
+                        line_parts = line_parts[1:]
+                        line_parts.reverse()
+                        seconds = 0.0
+                        second_multiplier = 1
+                        for part in line_parts:
+                            seconds += second_multiplier * float(part)
+                            second_multiplier *= 60
+                        log(job, "DEBUG_RUNTIME:{}".format(int(seconds)), identifier, function)
+                    except Exception as e:
+                        log(job, "Error consolidating debug runtime output: {}".format(e), identifier, function)
+                        log(job, line, identifier, function)
+
+                else:
+                    log(job, line, identifier, function)
 
 
 def log_generic_job_debug(job, identifier, function, work_dir=None):
@@ -904,7 +924,7 @@ def log(job, message, identifier=None, function=None):
 
 
 def log_time(job, function_name, start_time, sample_identifier=''):
-    log(job, "TIME:{}".format(int(time.time() - start_time)), sample_identifier, function_name)
+    log(job, "DEBUG_FUNCTION_REALTIME:{}".format(int(time.time() - start_time)), sample_identifier, function_name)
 
 
 
