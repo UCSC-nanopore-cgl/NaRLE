@@ -137,7 +137,7 @@ def prepare_input(job, sample, config):
 
     # job prep
     config = argparse.Namespace(**vars(config))
-    uuid, reads_url, assembly_url = sample
+    uuid, reads_url, assembly_url, align_url = sample
     config.uuid = uuid
     config.read_filetype = FT_FASTA[0] if is_fasta(reads_url) else (FT_FASTQ[0] if is_fastq(reads_url) else None)
     if is_zipped(reads_url):
@@ -183,7 +183,6 @@ def prepare_input(job, sample, config):
         raise UserError("FASTA filetype is not supported for input reads (yet)")
     else:
         reads_fq_fileid = reads_fileid
-        #TODO convert to fa
 
     # true reference
     true_reference_fileid = None
@@ -199,15 +198,20 @@ def prepare_input(job, sample, config):
             copy_files(file_paths=[true_reference_location], output_dir=config.intermediate_file_location)
 
     # assembly
-    assembly_fileid = None
-    if assembly_url is not None:
-        download_url(assembly_url, work_dir=work_dir)
-        assembly_basename = os.path.basename(assembly_url)
-        assembly_location = os.path.join(work_dir, "{}.assembly.{}".format(uuid, assembly_basename))
-        os.rename(os.path.join(work_dir, assembly_basename), assembly_location)
-        assembly_fileid = job.fileStore.writeGlobalFile(assembly_location)
-        if config.intermediate_file_location is not None:
-            copy_files(file_paths=[assembly_location], output_dir=config.intermediate_file_location)
+    download_url(assembly_url, work_dir=work_dir)
+    assembly_basename = os.path.basename(assembly_url)
+    assembly_location = os.path.join(work_dir, "{}.assembly.{}".format(uuid, assembly_basename))
+    os.rename(os.path.join(work_dir, assembly_basename), assembly_location)
+    assembly_fileid = job.fileStore.writeGlobalFile(assembly_location)
+
+    # align
+    align_fileid = None
+    if align_url is not None:
+        download_url(align_url, work_dir=work_dir)
+        align_basename = os.path.basename(align_url)
+        align_location = os.path.join(work_dir, "{}.align.{}".format(uuid, align_basename))
+        os.rename(os.path.join(work_dir, align_basename), align_location)
+        align_fileid = job.fileStore.writeGlobalFile(align_location)
 
     # params
     download_url(config.margin_params, work_dir=work_dir)
@@ -223,7 +227,7 @@ def prepare_input(job, sample, config):
         JD_READS_FQ: reads_fq_fileid,
         JD_TRUE_REF: true_reference_fileid,
         JD_ASSEMBLY: assembly_fileid,
-        JD_ASSEMBLY_ALIGN: None,
+        JD_ASSEMBLY_ALIGN: align_fileid,
         JD_MARGIN_POLISH_ASSEMBLY: None,
         JD_MARGIN_POLISH_PARAMS: params_fileid,
     }
@@ -234,26 +238,30 @@ def prepare_input(job, sample, config):
     # do we need to enqueue assembly job?
     assembly_job = job
     assembly_job_data = job_data
-    if assembly_url is None:
-        # alignment resource usage
-        asm_mem = estimate_asm_mem_usage(reads_size, config)
-        asm_dsk = estimate_asm_dsk_usage(reads_size, config)
-
-        # add jobs
-        assembly_job = job.addChildJobFn(generate_shasta_assembly, config, job_data,
-                                         cores=config.defaultCores, memory=asm_mem, disk=asm_dsk)
-        assembly_job_data = assembly_job.rv()
+    #TODO
+    # if assembly_url is None:
+    #     # alignment resource usage
+    #     asm_mem = estimate_asm_mem_usage(reads_size, config)
+    #     asm_dsk = estimate_asm_dsk_usage(reads_size, config)
+    #     # add jobs
+    #     assembly_job = job.addChildJobFn(generate_shasta_assembly, config, job_data,
+    #                                      cores=config.defaultCores, memory=asm_mem, disk=asm_dsk)
+    #     assembly_job_data = assembly_job.rv()
 
     # enqueue alignment job
-    aln_mem = estimate_aln_mem_usage(reads_size, config)
-    aln_dsk = estimate_aln_dsk_usage(reads_size, config)
-    assembly_align_job = assembly_job.addChildJobFn(align, config, assembly_job_data, JD_ASSEMBLY, JD_ASSEMBLY_ALIGN,
-                                       cores=config.defaultCores, memory=aln_mem, disk=aln_dsk)
+    assembly_align_job = assembly_job
+    assembly_align_job_data = assembly_job_data
+    if align_url is None:
+        aln_mem = estimate_aln_mem_usage(reads_size, config)
+        aln_dsk = estimate_aln_dsk_usage(reads_size, config)
+        assembly_align_job = assembly_job.addChildJobFn(align, config, assembly_job_data, JD_ASSEMBLY, JD_ASSEMBLY_ALIGN,
+                                                        cores=config.defaultCores, memory=aln_mem, disk=aln_dsk)
+        assembly_align_job_data = assembly_align_job.rv()
 
     # enqueue polish job
     pol_mem = estimate_aln_mem_usage(reads_size, config)
     pol_dsk = estimate_polish_mem_usage(reads_size, config)
-    margin_polish_job = assembly_align_job.addChildJobFn(run_margin_polish, config, assembly_align_job.rv(),
+    margin_polish_job = assembly_align_job.addChildJobFn(run_margin_polish, config, assembly_align_job_data,
                                            cores=config.defaultCores, memory=pol_mem, disk=pol_dsk)
     return_values.append(margin_polish_job.rv())
 
@@ -964,6 +972,9 @@ def generate_config():
         #   quast-params: --large
         quast-params: 
 
+        # Optional: Don't do polishing, only run qc (quast, etc)
+        only-qc: False
+
         # Optional: intermediate files will be saved to this directory with a job timestamp (only accepts file:// scheme)
         # Example:
         #   save-intermediate-files: file:///tmp/intermediate
@@ -980,7 +991,8 @@ def generate_manifest():
         #
         #   UUID            Required    A unique identifier for the sample to be processed.
         #   READS_URL       Required    A URL [{scheme}] pointing to the sample fastq
-        #   ASSEMBLY_URL    Optional    A URL [{scheme}] pointing to assembly (will skip assembly steps)
+        #   ASSEMBLY_URL    Required    A URL [{scheme}] pointing to assembly
+        #   ALIGN_URL       Optional    A URL [{scheme}] pointing to BAM alignment of reads to assembly
         #
         #   Examples of several combinations are provided below. Lines beginning with # are ignored.
         #
@@ -1022,16 +1034,17 @@ def parse_samples(config, path_to_manifest):
             sample = line.strip().split('\t')
 
             # validate structure
-            if len(sample) < 2:
-                raise UserError('Bad manifest format! Required at least 2 tab-separated columns, got: {}'.format(sample))
-            if len(sample) > 3:
-                raise UserError('Bad manifest format! Required at most 3 tab-separated columns, got: {}'.format(sample))
+            if len(sample) < 3:
+                raise UserError('Bad manifest format! Required at least 3 tab-separated columns, got: {}'.format(sample))
+            if len(sample) > 4:
+                raise UserError('Bad manifest format! Required at most 4 tab-separated columns, got: {}'.format(sample))
 
             # extract sample parts
             uuid = sample[0]
             reads_url = sample[1]
-            assembly_url = None
-            if len(sample) > 2: assembly_url = sample[2]
+            assembly_url = sample[2]
+            align_url = None
+            if len(sample) > 3: align_url = sample[3]
 
             # sanity checks
             if urlparse(reads_url).scheme not in SCHEMES:
@@ -1039,10 +1052,12 @@ def parse_samples(config, path_to_manifest):
             if not is_fasta(reads_url) and not is_fastq(reads_url):
                 raise UserError("Input type (fasta or fastq) of sample {} could not be determined: {}".format(
                     uuid, reads_url))
-            if assembly_url is not None and urlparse(assembly_url).scheme not in SCHEMES:
+            if urlparse(assembly_url).scheme not in SCHEMES:
                 raise UserError("Assembly URL {} is missing scheme. Expected: {}".format(assembly_url, [x + "://" for x in SCHEMES]))
+            if align_url is not None and urlparse(align_url).scheme not in SCHEMES:
+                raise UserError("Align URL {} is missing scheme. Expected: {}".format(align_url, [x + "://" for x in SCHEMES]))
 
-            sample = [uuid, reads_url, assembly_url]
+            sample = [uuid, reads_url, assembly_url, align_url]
             samples.append(sample)
     return samples
 
