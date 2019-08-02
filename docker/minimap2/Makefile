@@ -1,7 +1,7 @@
 # Definitions
 git_commit ?= $(shell git log --pretty=oneline -n 1 | cut -f1 -d " ")
 version = 2.12-r827
-name = tpesout/minmap2
+name = tpesout/minimap2
 tag = ${version}--${git_commit}
 
 build:
